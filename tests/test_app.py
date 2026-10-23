@@ -8,17 +8,27 @@ import time
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import os
+_BOOT_STATE=tempfile.TemporaryDirectory()
+os.environ['SEC_CHECKER_STATE_DIR']=_BOOT_STATE.name
+os.environ['SEC_CHECKER_DISABLE_RUNNER']='1'
 import app as web
+from jobs import Store,Runner
 import scanner
 
 class CheckerTests(unittest.TestCase):
     def setUp(self):
         web.app.config['TESTING']=True
-        web.JOBS.clear()
+        self.state=tempfile.TemporaryDirectory()
+        web.STORE=Store(self.state.name)
+        self.runner=Runner(web.STORE,lambda item:web.check_site(item),threads=2)
         self.client=web.app.test_client()
         self.client.get('/')
         with self.client.session_transaction() as session: self.csrf=session['csrf']
         self.headers={'X-CSRF-Token':self.csrf,'Origin':'http://localhost'}
+    def tearDown(self):
+        self.runner.close()
+        self.state.cleanup()
     def upload(self,content,name='history.json'):
         return self.client.post('/api/upload',data={'history':(io.BytesIO(content),name)},headers=self.headers)
     def test_import_strips_secrets_and_filters(self):
@@ -112,6 +122,59 @@ class CheckerTests(unittest.TestCase):
             import base64
             auth=base64.b64encode(b'reviewer:test-only-secret').decode()
             self.assertEqual(self.client.get('/',headers={'Authorization':'Basic '+auth}).status_code,200)
+
+    def test_two_people_upload_scan_and_download_independently(self):
+        import concurrent.futures
+        import threading
+        clients=[web.app.test_client(),web.app.test_client()]
+        headers=[]
+        for client in clients:
+            client.get('/')
+            with client.session_transaction() as sess:token=sess['csrf']
+            headers.append({'X-CSRF-Token':token,'Origin':'http://localhost'})
+        barrier=threading.Barrier(2)
+        original=web.extract
+        def simultaneous_extract(path):
+            result=original(path);barrier.wait(timeout=5);return result
+        def upload_for(index):
+            host=['alice.example','bob.example'][index]
+            return clients[index].post('/api/upload',headers=headers[index],data={'history':(io.BytesIO(('https://'+host+'/').encode()),'History')})
+        with patch.object(web,'extract',side_effect=simultaneous_extract):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:responses=list(pool.map(upload_for,[0,1]))
+        self.assertTrue(all(r.status_code==200 for r in responses))
+        self.assertEqual(responses[0].json['items'][0]['host'],'alice.example')
+        self.assertEqual(responses[1].json['items'][0]['host'],'bob.example')
+        def check(item):
+            return {'host':item['host'],'saved_login':False,'login_page_hint':False,'tls':'Validated','certificate':{},'php':{'status':'Unknown','evidence':''}}
+        with patch.object(web,'check_site',side_effect=check):
+            for index,host in enumerate(['alice.example','bob.example']):
+                self.assertEqual(clients[index].post('/api/scan',headers=headers[index],json={'hosts':[host],'reviewed':True}).status_code,202)
+            for _ in range(200):
+                if not any(client.get('/api/status').json['running'] for client in clients):break
+                time.sleep(.01)
+        for index,host in enumerate(['alice.example','bob.example']):
+            other=['bob.example','alice.example'][index]
+            self.assertIn(host,clients[index].get('/api/report/json').text)
+            self.assertNotIn(other,clients[index].get('/api/report/json').text)
+            self.assertNotIn(other,clients[index].get('/api/inventory').text)
+        clients[0].post('/api/clear',headers=headers[0],json={})
+        self.assertEqual(clients[0].get('/api/report/json').status_code,400)
+        self.assertIn('bob.example',clients[1].get('/api/report/json').text)
+
+    def test_raw_uploads_removed_on_success_and_error(self):
+        filenames=[];original=web.UploadRequest._get_file_stream
+        def track(request,*args,**kwargs):
+            stream=original(request,*args,**kwargs);filenames.append(stream.name);return stream
+        with patch.object(web.UploadRequest,'_get_file_stream',track):
+            self.assertEqual(self.upload(b'https://example.org/','History.txt').status_code,200)
+            self.assertEqual(self.upload(b'not a valid URL','History.txt').status_code,400)
+        self.assertEqual(len(filenames),2)
+        self.assertTrue(all(not Path(name).exists() for name in filenames))
+    def test_large_text_import_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'history.json'
+            with path.open('wb') as stream:stream.write(b'[');stream.truncate(33*1024*1024)
+            with self.assertRaisesRegex(ValueError,'32 MB'):web.extract(path)
 
     def test_actual_compromised_key_detection(self):
         # Verify the scanner compares public keys, not just issuer-name strings.

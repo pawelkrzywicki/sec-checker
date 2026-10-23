@@ -16,11 +16,11 @@ Open **http://SERVER_IP:8787** from your browser, or **http://127.0.0.1:8787** o
 docker compose down
 ```
 
-No browser profile mounts, privileged container, Docker socket mount, account passwords or external APIs are needed. The container runs as a non-root user with a read-only filesystem and temporary upload storage in RAM. Outbound Internet access is required for selected website checks. This is a single-user application. For access beyond a trusted private network, use an HTTPS reverse proxy and set an application password. Set `SEC_CHECKER_PASSWORD` in a local `.env` file, then recreate the container; the browser login username is `reviewer`. The password is optional for trusted local use. Basic authentication and uploaded files need HTTPS protection on untrusted networks. To bind only one interface, set `SEC_CHECKER_BIND_IP=192.168.1.10` (or `127.0.0.1` for local-only access).
+No browser profile mounts, privileged container, Docker socket mount, account passwords or external APIs are needed. The container runs as a non-root user with a read-only filesystem and temporary upload storage in RAM. Outbound Internet access is required for selected website checks. Different browser sessions have independent workspaces and can upload and scan concurrently. For access beyond a trusted private network, use an HTTPS reverse proxy and set an application password. Set `SEC_CHECKER_PASSWORD` in a local `.env` file, then recreate the container; the browser login username is `reviewer`. The password is optional for trusted local use. Basic authentication and uploaded files need HTTPS protection on untrusted networks. To bind only one interface, set `SEC_CHECKER_BIND_IP=192.168.1.10` (or `127.0.0.1` for local-only access).
 
 ## Import, review, check
 
-1. Upload Chrome’s `History` SQLite database or Takeout `BrowserHistory.json`. Optionally attach the same Chrome profile’s `Login Data` database to associate stored-password entries with sites (256 MB combined; unzip archives first).
+1. Upload Chrome’s `History` SQLite database or Takeout `BrowserHistory.json`. Optionally attach the same Chrome profile’s `Login Data` database to associate stored-password entries with sites (256 MB combined for databases; 32 MB maximum for JSON/CSV/text imports; unzip archives first).
 2. Review the domain list. Nothing is selected initially. Common adult domains are filtered, but automatic filtering is incomplete. Exclude sensitive domains before starting a scan.
 3. Select the sites, confirm the review, and run the checks. Select stored-password sites or login-path hints as a selection aid. Stored entries and login paths do not prove when or whether a login occurred.
 4. Download HTML, CSV or JSON findings. Stop requests with **Stop scan**, or remove imported domains and results with **Clear imported data**.
@@ -55,11 +55,30 @@ No exploits, port scans, authentication attempts, password leak lookups or crede
 
 ## Privacy and retention
 
-Raw uploads are removed after parsing, including on errors; Docker's temporary upload directory is a tmpfs. Only hostnames, login-path hints and stored-password association counts are retained in app memory. Page titles, usernames, historical paths, query strings, fragments and passwords are not retained in the inventory. The optional Chrome Login Data parser selects only `origin_url` from `logins`, checking `length(password_value) > 0` inside SQLite to detect the presence of a stored password. It never returns/decrypts encrypted password bytes or selects usernames. Blocklisted and empty-password entries are skipped. Plaintext password exports are not accepted in the optional saved-login field. This detects account associations, not password strength or password reuse. Uploading a raw database inherently provides its contents to this local app; review or prefilter the file first if even local processing is unacceptable.
+Raw uploads are removed after parsing, including on errors; Docker's temporary upload directory is a tmpfs. Only hostnames, login-path hints, stored-password association counts and results are retained in a shared SQLite session/queue store. In Docker, that store is on the private `/state` RAM filesystem, not a persistent volume. Raw history and raw Login Data uploads are never written to the queue store. Page titles, usernames, historical paths, query strings, fragments and passwords are not retained in the inventory. The optional Chrome Login Data parser selects only `origin_url` from `logins`, checking `length(password_value) > 0` inside SQLite to detect the presence of a stored password. It never returns/decrypts encrypted password bytes or selects usernames. Blocklisted and empty-password entries are skipped. Plaintext password exports are not accepted in the optional saved-login field. This detects account associations, not password strength or password reuse. Uploading a raw database inherently provides its contents to this local app; review or prefilter the file first if even local processing is unacceptable.
 
-No personal history, report, analytics, API key or telemetry is included in this repository or image. The app does not send the domain list to a scanning provider. Browser sessions are isolated and expire after two hours; **Clear imported data** removes the session's imported domains/results immediately when no scan is active. Stopping/restarting the container clears all memory. Downloaded reports remain wherever you save them. The server keeps no request access log by default.
+No personal history, report, analytics, API key or telemetry is included in this repository or image. The app does not send the domain list to a scanning provider. Browser sessions are isolated and expire after two hours; **Clear imported data** logically removes that session’s imported domains/results when no import or scan is active. Removing/recreating the container clears its temporary state store. Ordinary web-worker restarts keep the workspace and queue. In non-Docker development, the store lives in `/tmp/sec-checker-state` unless `SEC_CHECKER_STATE_DIR` overrides it, so it can survive a process restart. Expired records are removed by the queue workers; this is not a forensic secure-erasure guarantee. Downloaded reports remain wherever you save them. The server keeps no request access log by default.
 
 The incident indicator file is a **23 October 2026 snapshot**, not a live general vulnerability feed. Refresh it and review version rules as advisories change. Review upstream changes before installing dependencies or rebuilding later.
+
+## Concurrent users and capacity
+
+Each browser session has its own unguessable, signed session identifier. Inventory, queued sites, progress, cancellation and report downloads are always scoped to that session. Different users do not select a shared job identifier. Tabs in one browser profile intentionally share one workspace; use separate browser profiles/private windows for separate workspaces on the same device. These are temporary sessions, not named user accounts or an SSO/account system.
+
+The queue is shared across processes and uses transactional claims to avoid duplicate work. Sessions take turns, with defaults of **8 active site checks globally**, **2 per session**, and **2 simultaneous imports**. Additional scans wait; excess imports get a retryable busy response instead of allocating unbounded resources. Duplicate imports/scans in the same session are rejected. Queued scans can be cancelled independently. If a worker dies, its task lease expires after 120 seconds and the check can be retried (at most three attempts); stale results cannot overwrite a retried task. Network requests can therefore repeat during worker recovery.
+
+Limits are configurable through `.env` and Compose:
+
+```text
+WEB_WORKERS=2
+MAX_ACTIVE_CHECKS=8
+CHECKS_PER_SESSION=2
+MAX_PARALLEL_IMPORTS=2
+```
+
+There is a 1,000-live-session admission ceiling, 10,000 domains per import and a bounded temporary store; that is an admission limit, not a claim that 1,000 full-size uploads can run simultaneously. Large imports are bounded at 256 MB combined per request; JSON/CSV/text is limited to 32 MB to bound parsing memory. No load-test throughput guarantee is implied. Increase CPU/RAM/storage and benchmark before raising limits. Each web worker starts four check threads by default (`CHECK_THREADS_PER_WORKER`); the shared queue enforces the global and per-session ceilings regardless of worker count.
+
+For network access beyond a trusted group, set `SEC_CHECKER_PASSWORD`, put the service behind HTTPS and set `SEC_CHECKER_HTTPS=1` for secure session cookies. The shared access password controls entry; it does not grant access to another browser’s workspace. Keep the session cookie private. Multiple hosts, persistent accounts, account recovery, and distributed queues are outside this version.
 
 ## Development and tests
 
@@ -73,7 +92,7 @@ python -m unittest discover -s tests -v
 python app.py
 ```
 
-The development server listens on all interfaces at port 8787; use `BIND_HOST=127.0.0.1 python app.py` to restrict it to the server itself. Production uses one Gunicorn worker with threads because session state is held in memory. Do not increase worker count without moving session/job state to a shared store.
+The development server listens on all interfaces at port 8787; use `BIND_HOST=127.0.0.1 python app.py` to restrict it to the server itself. Production defaults to two Gunicorn workers sharing the SQLite session/queue store. Cookie signing keys are generated atomically in that same store, so requests can go to either worker. The SQLite file must be on a local filesystem; do not put it on NFS or share it across hosts.
 
 ## Sources
 

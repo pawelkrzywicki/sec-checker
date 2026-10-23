@@ -1,6 +1,8 @@
 *
 !Dockerfile
 !requirements.txt
+!jobs.py
+!gunicorn.conf.py
 !app.py
 !scanner.py
 !affected-certificates.json

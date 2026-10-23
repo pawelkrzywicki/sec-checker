@@ -1,5 +1,4 @@
-"""Single-user Chrome history and saved-login exposure review."""
-import concurrent.futures
+"""Concurrent Chrome history reviews with isolated sessions and a shared queue."""
 import csv
 import io
 import json
@@ -8,20 +7,31 @@ from pathlib import Path
 import secrets
 import sqlite3
 import tempfile
-import threading
 import time
 from urllib.parse import urlsplit
-from flask import Flask, jsonify, render_template, request, session, Response
+from flask import Flask, Request, jsonify, render_template, request, session, Response
 from werkzeug.exceptions import HTTPException
 from scanner import host_of, EXCLUDE, check_site, NOTICE, SOURCES
+from jobs import Store, Runner, Busy
+
+STORE = Store(os.environ.get('SEC_CHECKER_STATE_DIR', str(Path(tempfile.gettempdir())/'sec-checker-state')),
+    concurrency=int(os.environ.get('MAX_ACTIVE_CHECKS','8')),
+    per_session=int(os.environ.get('CHECKS_PER_SESSION','2')),
+    max_uploads=int(os.environ.get('MAX_PARALLEL_IMPORTS','2')))
+class UploadRequest(Request):
+    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+        # One temporary copy per upload, including large files; never use user filenames.
+        return tempfile.NamedTemporaryFile(prefix='sec-checker-upload-', suffix='.tmp')
 
 app = Flask(__name__)
-app.config.update(SECRET_KEY=secrets.token_hex(32), MAX_CONTENT_LENGTH=256*1024*1024,
+app.request_class=UploadRequest
+app.config.update(SECRET_KEY=STORE.secret(), MAX_CONTENT_LENGTH=256*1024*1024,
                   SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict',
+                  SESSION_COOKIE_SECURE=os.environ.get('SEC_CHECKER_HTTPS','0')=='1',
                   MAX_FORM_MEMORY_SIZE=512*1024, MAX_FORM_PARTS=5)
-LOCK = threading.RLock()
-JOBS = {}
-TTL = 7200
+RUNNER = None if os.environ.get('SEC_CHECKER_DISABLE_RUNNER')=='1' else Runner(
+    STORE, lambda item: check_site(item), threads=int(os.environ.get('CHECK_THREADS_PER_WORKER','4')))
+
 
 def urls_from_file(path):
     with open(path, 'rb') as f:
@@ -44,6 +54,8 @@ def urls_from_file(path):
         finally:
             db.close()
         return
+    if Path(path).stat().st_size > 32*1024*1024:
+        raise ValueError('JSON, CSV and text imports are limited to 32 MB. Use the Chrome History database for larger imports.')
     with open(path, encoding='utf-8-sig') as f:
         start = f.read(1)
         while start and start.isspace(): start=f.read(1)
@@ -118,32 +130,10 @@ def extract_saved_logins(path):
         db.close()
 
 
-def new_job():
-    return {'created':time.monotonic(),'items':[],'results':[], 'running':False,'done':0,'total':0,'cancel':threading.Event(),'error':None}
-
 def current():
-    with LOCK:
-        now=time.monotonic()
-        for key in list(JOBS):
-            if now-JOBS[key]['created']>TTL:
-                JOBS[key]['cancel'].set();del JOBS[key]
-        sid=session.get('sid')
-        if sid not in JOBS:
-            if len(JOBS)>=16: raise ValueError('Too many local sessions. Restart the app to clear them.')
-            sid=secrets.token_urlsafe(24);session['sid']=sid;JOBS[sid]=new_job()
-        return JOBS[sid]
-
-def expire_sessions():
-    while True:
-        time.sleep(30)
-        with LOCK:
-            for key in list(JOBS):
-                if time.monotonic()-JOBS[key]['created']>TTL:
-                    JOBS[key]['cancel'].set()
-                    del JOBS[key]
-
-threading.Thread(target=expire_sessions,daemon=True).start()
-
+    sid=STORE.ensure(session.get('sid'))
+    session['sid']=sid
+    return sid
 
 @app.before_request
 def guard():
@@ -168,10 +158,14 @@ def headers(response):
 
 @app.errorhandler(Exception)
 def error(exc):
+    if isinstance(exc,Busy):
+        return jsonify(error=str(exc)),exc.code
     if isinstance(exc,HTTPException):
         return jsonify(error='Upload too large (256 MB maximum).' if exc.code==413 else exc.name),exc.code
     if isinstance(exc,(ValueError,UnicodeError,json.JSONDecodeError)):
         return jsonify(error=str(exc)[:250]),400
+    if isinstance(exc,sqlite3.OperationalError) and any(text in str(exc).lower() for text in ('database is locked','database or disk is full','unable to open database')):
+        return jsonify(error='Shared storage is busy or full. Retry shortly or clear older sessions.'),503
     if isinstance(exc,sqlite3.Error):
         return jsonify(error='Could not read this history database. Close the browser and make a fresh copy, including its WAL if needed, or use a JSON export.'),400
     if app.testing:
@@ -186,24 +180,27 @@ def index():
     return render_template('index.html',csrf=session['csrf'])
 
 @app.get('/health')
-def health(): return jsonify(status='ok')
+def health():
+    STORE.secret()
+    return jsonify(status='ok')
 
 @app.post('/api/upload')
 def upload():
-    job=current()
-    with LOCK:
-        if job['running']: return jsonify(error='Stop the scan before uploading another file.'),409
-    f=request.files.get('history')
-    if not f: raise ValueError('Choose a browser history file.')
-    # Random path, no user filename, removed even if parsing fails.
-    with tempfile.TemporaryDirectory(prefix='history-review-') as tmp:
-        path=Path(tmp)/'upload';f.save(path)
+    sid=current()
+    previous=STORE.begin_upload(sid)
+    uploaded_files=[]
+    try:
+        files=request.files
+        uploaded_files=[value for _,value in files.items(multi=True)]
+        f=files.get('history')
+        if not f: raise ValueError('Choose a browser history file.')
+        # Request-owned files are deleted in finally, including on parse errors.
+        path=Path(f.stream.name)
         items,count,excluded=extract(path)
-        login_file = request.files.get('logins')
+        login_file = files.get('logins')
         login_hosts = {}
         if login_file and login_file.filename:
-            login_path = Path(tmp)/'saved-logins'
-            login_file.save(login_path)
+            login_path = Path(login_file.stream.name)
             login_hosts = extract_saved_logins(login_path)
         merged = {item['host']: item for item in items}
         for host, record_count in login_hosts.items():
@@ -212,66 +209,45 @@ def upload():
         if len(merged) > 10000:
             raise ValueError('Combined uploads exceed the 10,000-domain limit.')
         items = sorted(merged.values(), key=lambda x: (not x['saved_login'], not x['login_page_hint'], x['host']))
-    with LOCK:
-        job.update(items=items,results=[],done=0,total=0,error=None)
-    return jsonify(items=items,entries=count,excluded_entries=excluded,saved_login_domains=len(login_hosts))
-
-def scan(job,items):
-    try:
-        # Keep at most four requests queued so cancellation takes effect quickly.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            iterator=iter(items);pending=set()
-            for _ in range(min(4,len(items))): pending.add(pool.submit(check_site,next(iterator)))
-            while pending:
-                finished,pending=concurrent.futures.wait(pending,return_when=concurrent.futures.FIRST_COMPLETED)
-                for future in finished:
-                    result=future.result()
-                    with LOCK: job['results'].append(result);job['done']+=1
-                    if not job['cancel'].is_set():
-                        item=next(iterator,None)
-                        if item is not None: pending.add(pool.submit(check_site,item))
-    except Exception:
-        with LOCK: job['error']='Scan interrupted by an internal error. Completed results remain available.'
+        STORE.finish_upload(sid,items)
+    except BaseException:
+        STORE.abort_upload(sid,previous)
+        raise
     finally:
-        with LOCK: job['running']=False
+        for upload_file in uploaded_files:
+            upload_file.close()
+    return jsonify(items=items,entries=count,excluded_entries=excluded,saved_login_domains=len(login_hosts))
 
 @app.post('/api/scan')
 def start():
-    job=current();data=request.get_json(silent=True) or {}
+    sid=current();data=request.get_json(silent=True) or {}
     hosts=data.get('hosts')
     if data.get('reviewed') is not True or not isinstance(hosts,list) or not hosts or any(not isinstance(h,str) for h in hosts):
         raise ValueError('Select domains and confirm that you excluded sensitive sites.')
-    requested=set(hosts)
-    with LOCK:
-        if job['running']: return jsonify(error='A scan is already running.'),409
-        items=[x for x in job['items'] if x['host'] in requested]
-        if len(items)!=len(requested): raise ValueError('Selection contains a domain outside the uploaded history.')
-        job.update(results=[],running=True,done=0,total=len(items),cancel=threading.Event(),error=None)
-    threading.Thread(target=scan,args=(job,items),daemon=True).start()
-    return jsonify(started=True),202
+    STORE.enqueue(sid,set(hosts))
+    return jsonify(started=True,queued=True),202
 
 @app.post('/api/cancel')
 def cancel():
-    current()['cancel'].set()
-    return jsonify(message='Stopping after current requests finish.')
+    STORE.cancel(current())
+    return jsonify(message='Queued checks cancelled; current requests are finishing.')
 
 @app.post('/api/clear')
 def clear():
-    job=current()
-    with LOCK:
-        if job['running']: return jsonify(error='Stop the scan first, then clear the session.'),409
-        job.update(items=[],results=[],done=0,total=0,error=None)
+    STORE.clear(current())
     return jsonify(cleared=True)
+
+@app.get('/api/inventory')
+def inventory():
+    return jsonify(items=STORE.inventory(current()))
 
 @app.get('/api/status')
 def status():
-    job=current()
-    with LOCK:
-        return jsonify({**{k:job[k] for k in ('results','running','done','total','error')}, 'cancelled':job['cancel'].is_set()})
+    return jsonify(STORE.status(current()))
 
 @app.get('/api/report/<kind>')
 def report(kind):
-    with LOCK: results=list(current()['results'])
+    results=STORE.status(current())['results']
     if not results: raise ValueError('Run a check first.')
     stamp=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())
     if kind=='json':

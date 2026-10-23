@@ -4,9 +4,16 @@ services:
     ports:
       - "${SEC_CHECKER_BIND_IP:-0.0.0.0}:8787:8787"
     environment:
+      SEC_CHECKER_STATE_DIR: /state
+      WEB_WORKERS: "${WEB_WORKERS:-2}"
+      MAX_ACTIVE_CHECKS: "${MAX_ACTIVE_CHECKS:-8}"
+      CHECKS_PER_SESSION: "${CHECKS_PER_SESSION:-2}"
+      MAX_PARALLEL_IMPORTS: "${MAX_PARALLEL_IMPORTS:-2}"
+      SEC_CHECKER_HTTPS: "${SEC_CHECKER_HTTPS:-0}"
       SEC_CHECKER_PASSWORD: "${SEC_CHECKER_PASSWORD:-}"
     read_only: true
     tmpfs:
+      - /state:rw,noexec,nosuid,size=300m,uid=10001,gid=10001,mode=0700
       - /tmp:rw,noexec,nosuid,size=768m,mode=1777
     cap_drop:
       - ALL
