@@ -71,6 +71,7 @@ def get_chain(sock):
 
 def check_site(item):
     from cryptography import x509
+    from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import serialization
     host = item['host']
     result = {'host': host, 'saved_login': item['saved_login'], 'login_page_hint': item['login_page_hint'],
@@ -87,6 +88,12 @@ def check_site(item):
             with context.wrap_socket(raw, server_hostname=host) as sock:
                 sock.settimeout(8)
                 chain, full_chain = get_chain(sock)
+                leaf = x509.load_der_x509_certificate(chain[0])
+                organizations = leaf.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+                common_names = leaf.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
+                provider = organizations[0].value if organizations else common_names[0].value if common_names else 'Unknown'
+                result['certificate'] = {'provider': provider, 'issuer': leaf.issuer.rfc4514_string(), 'leaf_sha256': hashlib.sha256(chain[0]).hexdigest(),
+                    'chain_certificates_seen': len(chain), 'chain_available': full_chain}
                 matches = []
                 for der in chain:
                     cert = x509.load_der_x509_certificate(der)
@@ -97,9 +104,6 @@ def check_site(item):
                     result['tls'] = 'Affected eMudhra key present — stop using this connection'
                     result['certificate']['affected_matches'] = matches
                     return result
-                leaf = x509.load_der_x509_certificate(chain[0])
-                result['certificate'] = {'issuer': leaf.issuer.rfc4514_string(), 'leaf_sha256': hashlib.sha256(chain[0]).hexdigest(),
-                    'chain_certificates_seen': len(chain), 'chain_available': full_chain}
                 result['tls'] = ('TLS identity/date/trust validation passed; no affected eMudhra key in presented chain'
                     if full_chain else 'TLS validation passed; full chain unavailable — eMudhra result incomplete')
                 # No authentication, cookies, URL parameters, body, exploit, or redirects.

@@ -2,7 +2,9 @@ services:
   history-checker:
     build: .
     ports:
-      - "127.0.0.1:8787:8787"
+      - "${SEC_CHECKER_BIND_IP:-0.0.0.0}:8787:8787"
+    environment:
+      SEC_CHECKER_PASSWORD: "${SEC_CHECKER_PASSWORD:-}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=768m,mode=1777

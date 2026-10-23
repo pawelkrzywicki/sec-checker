@@ -1,4 +1,4 @@
-"""Single-user, localhost browser-history upload and exposure review."""
+"""Single-user Chrome history and saved-login exposure review."""
 import concurrent.futures
 import csv
 import io
@@ -82,6 +82,42 @@ def extract(path):
     if not hosts: raise ValueError('No supported HTTP(S) history URLs were found. Unzip Takeout first and upload BrowserHistory.json.')
     return sorted(hosts.values(),key=lambda x:(not x['login_page_hint'],x['host'])),count,excluded
 
+def extract_saved_logins(path):
+    with open(path, 'rb') as source:
+        if source.read(16) != b'SQLite format 3\x00':
+            raise ValueError('The optional saved-login file must be Chrome Login Data, not a plaintext password export.')
+    db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
+    try:
+        db.execute('PRAGMA query_only=ON')
+        db.execute('PRAGMA trusted_schema=OFF')
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'logins' not in tables:
+            raise ValueError('The optional file is not a Chrome Login Data database.')
+        columns = {row[1] for row in db.execute('PRAGMA table_info(logins)')}
+        if not {'origin_url', 'password_value'} <= columns:
+            raise ValueError('Chrome saved-login database is missing required columns.')
+        # SQL checks presence only: encrypted password bytes and usernames are never returned.
+        query = 'SELECT origin_url FROM logins WHERE length(password_value) > 0'
+        if 'blacklisted_by_user' in columns:
+            query += ' AND COALESCE(blacklisted_by_user, 0) = 0'
+        deadline = time.monotonic() + 30
+        db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+        db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2*1024*1024)
+        hosts = {}; records = 0
+        for (url,) in db.execute(query):
+            records += 1
+            if records > 2_000_000:
+                raise ValueError('Too many saved-login records.')
+            host = host_of(url or '')
+            if host and not EXCLUDE.search(host):
+                hosts[host] = hosts.get(host, 0) + 1
+            if len(hosts) > 10000:
+                raise ValueError('Too many saved-login domains.')
+        return hosts
+    finally:
+        db.close()
+
+
 def new_job():
     return {'created':time.monotonic(),'items':[],'results':[], 'running':False,'done':0,'total':0,'cancel':threading.Event(),'error':None}
 
@@ -111,8 +147,14 @@ threading.Thread(target=expire_sessions,daemon=True).start()
 
 @app.before_request
 def guard():
-    if request.host.split(':')[0] not in ('127.0.0.1','localhost'):
-        return jsonify(error='This app accepts localhost requests only.'),403
+    # The user may access the UI by server IP or a configured domain.
+    # Keep same-origin CSRF checks; an optional password protects shared servers.
+    password = os.environ.get('SEC_CHECKER_PASSWORD', '')
+    if password and request.path != '/health':
+        auth = request.authorization
+        valid = auth and auth.type.lower() == 'basic' and auth.username == 'reviewer' and secrets.compare_digest((auth.password or '').encode(), password.encode())
+        if not valid:
+            return Response('Authentication required.', 401, {'WWW-Authenticate': 'Basic realm="Sec Checker"'})
     if request.method=='POST':
         expected=session.get('csrf','')
         if not expected or not secrets.compare_digest(request.headers.get('X-CSRF-Token',''),expected) or request.headers.get('Origin')!=request.host_url.rstrip('/'):
@@ -157,9 +199,22 @@ def upload():
     with tempfile.TemporaryDirectory(prefix='history-review-') as tmp:
         path=Path(tmp)/'upload';f.save(path)
         items,count,excluded=extract(path)
+        login_file = request.files.get('logins')
+        login_hosts = {}
+        if login_file and login_file.filename:
+            login_path = Path(tmp)/'saved-logins'
+            login_file.save(login_path)
+            login_hosts = extract_saved_logins(login_path)
+        merged = {item['host']: item for item in items}
+        for host, record_count in login_hosts.items():
+            item = merged.setdefault(host, {'host': host, 'saved_login': False, 'login_page_hint': False})
+            item.update(saved_login=True, saved_login_count=record_count)
+        if len(merged) > 10000:
+            raise ValueError('Combined uploads exceed the 10,000-domain limit.')
+        items = sorted(merged.values(), key=lambda x: (not x['saved_login'], not x['login_page_hint'], x['host']))
     with LOCK:
         job.update(items=items,results=[],done=0,total=0,error=None)
-    return jsonify(items=items,entries=count,excluded_entries=excluded)
+    return jsonify(items=items,entries=count,excluded_entries=excluded,saved_login_domains=len(login_hosts))
 
 def scan(job,items):
     try:
@@ -222,9 +277,9 @@ def report(kind):
     if kind=='json':
         body=json.dumps({'generated_utc':stamp,'limitations':NOTICE,'sources':SOURCES,'results':results},indent=2);mime='application/json'
     elif kind=='csv':
-        out=io.StringIO();writer=csv.writer(out);writer.writerow(['Host','Login-page hint','TLS','PHP','Evidence','Error'])
+        out=io.StringIO();writer=csv.writer(out);writer.writerow(['Host','Stored password entry','Login-page hint','Certificate provider','Certificate issuer','TLS','PHP','Evidence','Error'])
         for r in results:
-            row=[r['host'],r['login_page_hint'],r['tls'],r['php']['status'],r['php']['evidence'],r.get('error','')]
+            row=[r['host'],r.get('saved_login',False),r['login_page_hint'],r.get('certificate',{}).get('provider','Unknown'),r.get('certificate',{}).get('issuer','Unknown'),r['tls'],r['php']['status'],r['php']['evidence'],r.get('error','')]
             writer.writerow(["'"+v if isinstance(v,str) and v.startswith(('=','+','-','@','\t','\r')) else v for v in row])
         body=out.getvalue();mime='text/csv'
     elif kind=='html':
@@ -233,4 +288,4 @@ def report(kind):
     return Response(body,mimetype=mime,headers={'Content-Disposition':f'attachment; filename="site-exposure-report.{kind}"'})
 
 if __name__=='__main__':
-    app.run(host='127.0.0.1',port=int(os.environ.get('PORT','8787')),debug=False)
+    app.run(host=os.environ.get('BIND_HOST','0.0.0.0'),port=int(os.environ.get('PORT','8787')),debug=False)

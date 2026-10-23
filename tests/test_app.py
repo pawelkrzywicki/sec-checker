@@ -14,6 +14,7 @@ import scanner
 class CheckerTests(unittest.TestCase):
     def setUp(self):
         web.app.config['TESTING']=True
+        web.JOBS.clear()
         self.client=web.app.test_client()
         self.client.get('/')
         with self.client.session_transaction() as session: self.csrf=session['csrf']
@@ -34,7 +35,7 @@ class CheckerTests(unittest.TestCase):
     def test_csrf_origin_and_session_isolation(self):
         self.assertEqual(self.client.post('/api/upload').status_code,403)
         self.assertEqual(self.client.post('/api/clear',json={},headers={'X-CSRF-Token':self.csrf,'Origin':'https://evil.example'}).status_code,403)
-        self.assertEqual(self.client.get('/',headers={'Host':'evil.example'}).status_code,403)
+        self.assertEqual(self.client.get('/',headers={'Host':'192.168.1.10:8787'}).status_code,200)
         self.upload(b'https://example.org\n','urls.txt')
         other=web.app.test_client();other.get('/')
         self.assertEqual(other.get('/api/status').json['results'],[])
@@ -66,6 +67,52 @@ class CheckerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)/'Login Data';db=sqlite3.connect(p);db.execute('CREATE TABLE logins(password_value blob)');db.commit();db.close()
             self.assertEqual(self.upload(p.read_bytes()).status_code,400)
+    def test_chrome_saved_login_associations_without_secret_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'Login Data'
+            db=sqlite3.connect(p)
+            db.execute('CREATE TABLE logins(origin_url text, password_value blob, username_value text, blacklisted_by_user int)')
+            db.executemany('INSERT INTO logins VALUES (?,?,?,?)',[
+                ('https://example.org/login?private=SECRET',b'ENCRYPTED_SECRET','PRIVATE_USERNAME',0),
+                ('https://saved-only.example/',b'ENCRYPTED_SECRET','PRIVATE_USERNAME',0),
+                ('https://blocked.example/',b'ENCRYPTED_SECRET','PRIVATE_USERNAME',1),
+                ('https://empty.example/',b'','PRIVATE_USERNAME',0),
+                ('https://xvideos.com/',b'ENCRYPTED_SECRET','PRIVATE_USERNAME',0)])
+            db.commit();db.close()
+            response=self.client.post('/api/upload',data={
+                'history':(io.BytesIO(b'https://example.org/\n'),'History.txt'),
+                'logins':(io.BytesIO(p.read_bytes()),'Login Data')},headers=self.headers)
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json['saved_login_domains'],2)
+            self.assertEqual({x['host'] for x in response.json['items']},{'example.org','saved-only.example'})
+            self.assertTrue(all(x['saved_login'] for x in response.json['items']))
+            for secret in ['ENCRYPTED_SECRET','PRIVATE_USERNAME','SECRET','blocked.example','empty.example','xvideos']:
+                self.assertNotIn(secret,response.text)
+    def test_upload_and_scan_through_server_ip(self):
+        client=web.app.test_client();base='http://192.168.1.10:8787'
+        r=client.get('/',base_url=base)
+        self.assertEqual(r.status_code,200)
+        with client.session_transaction(base_url=base) as sess:csrf=sess['csrf']
+        headers={'X-CSRF-Token':csrf,'Origin':base}
+        r=client.post('/api/upload',base_url=base,headers=headers,data={'history':(io.BytesIO(b'https://example.org/'),'History.txt')})
+        self.assertEqual(r.status_code,200)
+        fixture={'host':'example.org','saved_login':False,'login_page_hint':False,'tls':'Validated','certificate':{'provider':'Test CA','issuer':'CN=Test CA'},'php':{'status':'Unknown','evidence':''}}
+        with patch.object(web,'check_site',return_value=fixture):
+            r=client.post('/api/scan',base_url=base,headers=headers,json={'hosts':['example.org'],'reviewed':True})
+            self.assertEqual(r.status_code,202)
+            for _ in range(100):
+                if not client.get('/api/status',base_url=base).json['running']:break
+                time.sleep(.01)
+        for kind in ['html','csv','json']:
+            self.assertIn('Test CA',client.get('/api/report/'+kind,base_url=base).text)
+    def test_optional_server_password(self):
+        with patch.dict(web.os.environ,{'SEC_CHECKER_PASSWORD':'test-only-secret'}):
+            self.assertEqual(self.client.get('/').status_code,401)
+            self.assertEqual(self.client.get('/health').status_code,200)
+            import base64
+            auth=base64.b64encode(b'reviewer:test-only-secret').decode()
+            self.assertEqual(self.client.get('/',headers={'Authorization':'Basic '+auth}).status_code,200)
+
     def test_actual_compromised_key_detection(self):
         # Verify the scanner compares public keys, not just issuer-name strings.
         from cryptography.hazmat.primitives import serialization
