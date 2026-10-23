@@ -4,3 +4,12 @@ __pycache__/
 History
 *report*.json
 *report*.csv
+.env
+*.db
+*.sqlite*
+History*
+Login Data*
+*.json
+!affected-certificates.json
+*.csv
+private-*
