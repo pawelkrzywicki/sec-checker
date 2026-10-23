@@ -30,7 +30,8 @@ class CheckerTests(unittest.TestCase):
         with self.client.session_transaction() as session: self.csrf=session['csrf']
         self.headers={'X-CSRF-Token':self.csrf,'Origin':'http://localhost'}
     def authorize(self,client,base_url='http://localhost'):
-        with client.session_transaction(base_url=base_url) as sess:sess['sid']=web.STORE.sign_in(web.auth_settings()[2])
+        import base64
+        client.environ_base['HTTP_AUTHORIZATION']='Basic '+base64.b64encode(b'reviewer:fixture-password-only').decode()
     def tearDown(self):
         self.runner.close()
         self.state.cleanup()
@@ -50,8 +51,8 @@ class CheckerTests(unittest.TestCase):
                 r=self.upload(p.read_bytes(),'History');self.assertEqual(r.status_code,200);self.assertEqual(r.json['items'][0]['host'],'example.net')
     def test_csrf_origin_and_session_isolation(self):
         self.assertEqual(self.client.post('/api/upload').status_code,403)
-        self.assertEqual(self.client.post('/api/clear',json={},headers={'X-CSRF-Token':self.csrf,'Origin':'https://evil.example'}).status_code,403)
-        self.assertEqual(self.client.get('/',headers={'Host':'192.168.1.10:8787'}).status_code,302)
+        self.assertEqual(self.client.post('/api/clear',json={},headers={'X-CSRF-Token':self.csrf,'Origin':'https://evil.example','Sec-Fetch-Site':'cross-site'}).status_code,403)
+        self.assertEqual(self.client.get('/',headers={'Host':'192.168.1.10:8787'}).status_code,200)
         self.upload(b'https://example.org\n','urls.txt')
         other=web.app.test_client();self.authorize(other);other.get('/')
         self.assertEqual(other.get('/api/status').json['results'],[])
@@ -123,7 +124,7 @@ class CheckerTests(unittest.TestCase):
             self.assertIn('Test CA',client.get('/api/report/'+kind,base_url=base).text)
     def test_password_is_required(self):
         client=web.app.test_client()
-        self.assertEqual(client.get('/').status_code,302)
+        self.assertEqual(client.get('/').status_code,401)
         self.assertEqual(client.get('/api/status').status_code,401)
         self.assertEqual(client.get('/health').status_code,200)
         with patch.dict(web.os.environ,{'SEC_CHECKER_PASSWORD':'','SEC_CHECKER_PASSWORD_HASH':''}):

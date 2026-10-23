@@ -35,9 +35,6 @@ class Store:
                     item TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
                     owner TEXT, lease_until REAL NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0, result TEXT);
-                CREATE TABLE IF NOT EXISTS access_sessions (
-                    sid TEXT PRIMARY KEY REFERENCES sessions(sid) ON DELETE CASCADE,
-                    version TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS login_limits (
                     bucket TEXT PRIMARY KEY, attempts INTEGER NOT NULL, reset_after REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS tasks_session ON tasks(sid,id);
@@ -92,20 +89,16 @@ class Store:
             db.execute('INSERT INTO sessions(sid,created,expires) VALUES (?,?,?)',(sid,now,now+self.ttl))
             return sid
 
-    def sign_in(self,version):
-        sid=self.ensure()
-        with self.transaction() as db:
-            db.execute('INSERT INTO access_sessions(sid,version) VALUES (?,?)',(sid,version))
-        return sid
-
-    def authorized(self,sid,version):
-        if not sid or not version:return False
-        with closing(self.connect()) as db:
-            return bool(db.execute('SELECT 1 FROM access_sessions a JOIN sessions s ON s.sid=a.sid WHERE a.sid=? AND a.version=? AND s.expires>?',(sid,version,time.time())).fetchone())
-
     def sign_out(self,sid):
         with self.transaction() as db:
             db.execute('DELETE FROM sessions WHERE sid=?',(sid,))
+
+    def login_wait(self,bucket):
+        with closing(self.connect()) as db:
+            row=db.execute('SELECT attempts,reset_after FROM login_limits WHERE bucket=?',(bucket,)).fetchone()
+            if row and row['attempts']>=10 and row['reset_after']>time.time():
+                return max(1,int(row['reset_after']-time.time()))
+            return 0
 
     def login_attempt(self,bucket):
         with self.transaction() as db:

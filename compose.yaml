@@ -12,6 +12,7 @@ services:
       SEC_CHECKER_PUBLIC_URL: "${SEC_CHECKER_PUBLIC_URL:-https://sec-checker.pawelkrzywicki.com}"
       SEC_CHECKER_COOKIE_NAME: "${SEC_CHECKER_COOKIE_NAME:-sec_checker_session}"
       SEC_CHECKER_HTTPS: "${SEC_CHECKER_HTTPS:-0}"
+      SEC_CHECKER_USERNAME: "${SEC_CHECKER_USERNAME:-reviewer}"
       SEC_CHECKER_PASSWORD_HASH: "${SEC_CHECKER_PASSWORD_HASH:-}"
       SEC_CHECKER_PASSWORD: "${SEC_CHECKER_PASSWORD:-}"
     read_only: true

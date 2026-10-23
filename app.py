@@ -14,7 +14,7 @@ from flask import Flask, Request, jsonify, render_template, request, session, Re
 from werkzeug.exceptions import HTTPException
 from scanner import host_of, EXCLUDE, check_site, NOTICE, SOURCES
 from jobs import Store, Runner, Busy
-from auth import settings as auth_settings, verify as verify_password
+from auth import settings as auth_settings, verify_basic
 from findings import select as select_findings
 
 STORE = Store(os.environ.get('SEC_CHECKER_STATE_DIR', str(Path(tempfile.gettempdir())/'sec-checker-state')),
@@ -167,50 +167,36 @@ def current():
 
 @app.before_request
 def guard():
-    if request.endpoint=='login' and request.method=='POST':
-        request.max_content_length=8192
-    public=request.endpoint in ('login','static','health')
-    if not public:
-        _,_,version=auth_settings()
-        if not version:
-            if request.path.startswith('/api/') or request.endpoint=='logout':
-                return jsonify(error='An app password must be configured before use.'),503
-            return render_template('login.html',csrf='',error=None,configured=False),503
-        if not STORE.authorized(session.get('sid'),version):
-            session.clear()
-            if request.path.startswith('/api/') or request.endpoint=='logout':
-                return jsonify(error='Sign in to access your workspace.',login_required=True),401
-            return redirect(url_for('login'))
+    if request.endpoint not in ('static','health'):
+        _,_,configured=auth_settings()
+        if not configured:
+            return jsonify(error='An app password must be configured before use.'),503
+        auth=request.authorization
+        valid=False
+        if auth and auth.type.lower()=='basic':
+            bucket=hashlib.sha256((STORE.secret()+(request.remote_addr or 'unknown')).encode()).hexdigest()
+            wait=STORE.login_wait(bucket)
+            if wait:
+                return jsonify(error='Too many failed attempts. Please try again later.'),429,{'Retry-After':str(wait)}
+            # Count failed requests in a fixed window; successful polling must not
+            # erase another client’s failed-attempt count.
+            # Keyed-digest success caching avoids repeated expensive hash checks.
+            valid=verify_basic(auth.username or '',auth.password or '',STORE.secret())
+            if not valid:
+                wait=STORE.login_attempt(bucket)
+                if wait:
+                    return jsonify(error='Too many failed attempts. Please try again later.'),429,{'Retry-After':str(wait)}
+        if not valid:
+            return jsonify(error='Enter your Sec Checker username and password.',login_required=True),401,{
+                'WWW-Authenticate':'Basic realm="Sec Checker", charset="UTF-8"'}
     if request.method=='POST':
         expected=session.get('csrf','')
-        token=request.form.get('csrf','') if request.endpoint=='login' else request.headers.get('X-CSRF-Token','')
-        def origin_of(value):
-            try:
-                parsed=urlsplit(value)
-                if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password:return None
-                port=parsed.port or (443 if parsed.scheme=='https' else 80)
-                return parsed.scheme.lower(),parsed.hostname.lower(),port
-            except ValueError:return None
-        origin=request.headers.get('Origin')
-        expected_origins={value for value in [origin_of(request.host_url)] if value is not None}
-        public_url=os.environ.get('SEC_CHECKER_PUBLIC_URL','').strip()
-        if public_url:
-            configured=origin_of(public_url)
-            if configured:expected_origins.add(configured)
-        # A CSRF token remains mandatory. Browsers may omit Origin on form posts.
-        # Sec-Fetch-Site is browser-controlled and reflects the external page URL,
-        # including when a reverse proxy changes the backend scheme/host.
-        origin_ok=(not origin or origin_of(origin) in expected_origins or
-            (request.headers.get('Sec-Fetch-Site')=='same-origin' and origin_of(origin) is not None))
+        token=request.headers.get('X-CSRF-Token','')
+        # Login is HTTP Basic: no login form/token or proxy-origin comparison.
+        # Mutating app requests still require their own signed-session CSRF token.
         valid_token=bool(expected and token and secrets.compare_digest(token.encode(),expected.encode()))
-        if not valid_token or not origin_ok:
-            if request.endpoint=='login':
-                session['csrf']=secrets.token_urlsafe(32)
-                _,_,version=auth_settings()
-                error=('The sign-in page expired or its cookie was replaced. This page has been refreshed; please enter the password again. Use the same app address and allow cookies.' if not valid_token else
-                    'The app address does not match this sign-in page. Open the app using its normal address; if a proxy changes it, configure SEC_CHECKER_PUBLIC_URL to that external address.')
-                return render_template('login.html',csrf=session['csrf'],error=error,configured=bool(version)),403
-            return jsonify(error='The page session changed. Refresh this page and try again.',reload_required=True),403
+        if not valid_token or request.headers.get('Sec-Fetch-Site')=='cross-site':
+            return jsonify(error='The workspace page changed. Reload it and try again.',reload_required=True),403
 
 @app.after_request
 def headers(response):
@@ -235,37 +221,18 @@ def error(exc):
     # Do not log raw URLs, upload contents, or filenames in exception details.
     return jsonify(error='The operation failed. Check the file format and try again.'),500
 
-@app.route('/login',methods=['GET','POST'])
+@app.get('/login')
 def login():
-    _,_,version=auth_settings()
-    if not version:
-        return render_template('login.html',csrf='',error=None,configured=False),503
-    if request.method=='GET' and STORE.authorized(session.get('sid'),version):
-        return redirect(url_for('index'))
-    session.setdefault('csrf',secrets.token_urlsafe(32))
-    error=None;code=200
-    if request.method=='POST':
-        bucket=hashlib.sha256((STORE.secret()+(request.remote_addr or 'unknown')).encode()).hexdigest()
-        wait=STORE.login_attempt(bucket)
-        if wait:
-            response=Response(render_template('login.html',csrf=session['csrf'],configured=True,error='Too many attempts. Please try again later.'),429,mimetype='text/html')
-            response.headers['Retry-After']=str(wait)
-            return response
-        password=request.form.get('password','')
-        if len(password)<=1024 and verify_password(password):
-            STORE.reset_login_attempts(bucket)
-            session.clear()
-            session['sid']=STORE.sign_in(version)
-            session['csrf']=secrets.token_urlsafe(32)
-            return redirect(url_for('index'))
-        error='Incorrect password.';code=401
-    return render_template('login.html',csrf=session['csrf'],error=error,configured=True),code
+    # Keep old bookmarks working; the browser handles the authentication prompt.
+    return redirect(url_for('index'))
 
 @app.post('/logout')
 def logout():
+    # Browsers cache HTTP Basic credentials. This ends the workspace only;
+    # it must not claim to revoke credentials the browser still sends.
     STORE.sign_out(session.get('sid'))
     session.clear()
-    return jsonify(signed_out=True)
+    return jsonify(workspace_closed=True)
 
 @app.get('/')
 def index():
@@ -276,7 +243,7 @@ def index():
 @app.get('/health')
 def health():
     STORE.secret()
-    return jsonify(status='ok',release='public-origin-default-1',public_url=os.environ.get('SEC_CHECKER_PUBLIC_URL','').strip() or None)
+    return jsonify(status='ok',release='basic-auth-1',public_url=os.environ.get('SEC_CHECKER_PUBLIC_URL','').strip() or None)
 
 @app.post('/api/upload')
 def upload():
