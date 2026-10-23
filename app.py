@@ -276,7 +276,7 @@ def index():
 @app.get('/health')
 def health():
     STORE.secret()
-    return jsonify(status='ok')
+    return jsonify(status='ok',release='public-origin-default-1',public_url=os.environ.get('SEC_CHECKER_PUBLIC_URL','').strip() or None)
 
 @app.post('/api/upload')
 def upload():

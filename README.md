@@ -97,6 +97,12 @@ There is a 1,000-live-session admission ceiling, 10,000 domains per import and a
 
 Put network access behind HTTPS and set `SEC_CHECKER_HTTPS=1` for secure session cookies. The shared app password controls entry; it does not grant access to another browser’s workspace. This is one shared password, not individual user accounts. Successful login creates a new server-verified session valid for two hours. Sign-out deletes that workspace and invalidates its access even if an old cookie is replayed. Changing the configured password invalidates existing sign-ins. Ten login attempts from one source address within ten minutes trigger a temporary limit shared by web workers. Source addresses are stored only as salted hash buckets for this limiter. Keep the session cookie private. Multiple hosts, persistent accounts, account recovery, and distributed queues are outside this version.
 
+## Public deployment address
+
+This deployment's tracked Compose default is `https://sec-checker.pawelkrzywicki.com`. It can be overridden with `SEC_CHECKER_PUBLIC_URL` in the hosting server's environment or `.env`. The default is non-secret and travels through Git; `.env`, passwords and generated credential files do not. A `.env` created on a development computer is not automatically copied to the actual hosting server.
+
+After deploying, visit `/health` on the public hostname. It reports only `status`, `release` and `public_url`, never passwords or session data. The release `public-origin-default-1` and your public URL confirm this image and routing configuration reached the running server. If the release is absent, the old image is still running; if `public_url` is missing or wrong, the container's environment has not been updated. Recreate it using this repository's Compose file on the actual hosting machine. If you use a separate deployment manager, set `SEC_CHECKER_PUBLIC_URL` there too.
+
 ## Login session troubleshooting
 
 Sec Checker uses its own `sec_checker_session` cookie rather than Flask's generic `session` name, avoiding collisions with other apps on the same hostname (cookies are not isolated by port). Separate Sec Checker installations on the same hostname can set different `SEC_CHECKER_COOKIE_NAME` values. After an upgrade or cookie replacement, an expired sign-in form returns a refreshed sign-in page instead of a raw JSON error. Use one consistent app address and allow its cookies.

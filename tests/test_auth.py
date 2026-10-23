@@ -97,3 +97,11 @@ class AuthenticationTests(unittest.TestCase):
         client.set_cookie('session','another-apps-cookie')
         response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'},headers={'Origin':'http://localhost'})
         self.assertEqual(response.status_code,302)
+
+    def test_health_reports_only_nonsecret_public_configuration(self):
+        with patch.dict(web.os.environ,{'SEC_CHECKER_PUBLIC_URL':'https://sec-checker.pawelkrzywicki.com'}):
+            client=web.app.test_client();response=client.get('/health')
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.json['public_url'],'https://sec-checker.pawelkrzywicki.com')
+            self.assertEqual(set(response.json),{'status','release','public_url'})
+            self.assertNotIn('fixture-password-only',response.text)
