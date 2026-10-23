@@ -9,6 +9,7 @@ $('upload-form').onsubmit=async e=>{e.preventDefault();$('upload').disabled=true
 $('search').oninput=render;
 $('stored').onclick=()=>{items.filter(x=>x.saved_login).forEach(x=>selected.add(x.host));$('reviewed').checked=false;render();};
 $('hints').onclick=()=>{items.filter(x=>x.login_page_hint).forEach(x=>selected.add(x.host));$('reviewed').checked=false;render();};
+$('select-all').onclick=()=>{items.forEach(x=>selected.add(x.host));$('reviewed').checked=false;render();};
 $('visible').onclick=()=>{filtered().forEach(x=>selected.add(x.host));$('reviewed').checked=false;render();};
 $('none').onclick=()=>{selected.clear();$('reviewed').checked=false;render();};
 $('scan').onclick=async()=>{if(!selected.size||!$('reviewed').checked){message('Select sites and confirm you excluded sensitive domains.');return;}try{await api('/api/scan',{hosts:[...selected],reviewed:true});$('scan').disabled=true;$('upload').disabled=true;$('cancel').disabled=false;$('findings').hidden=false;clearInterval(timer);timer=setInterval(poll,1500);poll();}catch(e){message(e.message);}};
