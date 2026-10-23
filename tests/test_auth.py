@@ -22,10 +22,10 @@ class AuthenticationTests(unittest.TestCase):
             self.assertEqual(client.get('/api/status').status_code,401)
             self.assertEqual(self.login(client,'correct-password-fixture').status_code,302)
             self.assertEqual(client.get('/').status_code,200)
-            cookie=client.get_cookie('session').value
+            cookie=client.get_cookie(web.app.config['SESSION_COOKIE_NAME']).value
             with client.session_transaction() as sess:token=sess['csrf']
             self.assertEqual(client.post('/logout',json={},headers={'Origin':'http://localhost','X-CSRF-Token':token}).status_code,200)
-            client.set_cookie('session',cookie)
+            client.set_cookie(web.app.config['SESSION_COOKIE_NAME'],cookie)
             self.assertEqual(client.get('/api/status').status_code,401)
             self.assertNotIn('correct-password-fixture',cookie)
     def test_all_data_endpoints_require_authentication(self):
@@ -56,3 +56,44 @@ class AuthenticationTests(unittest.TestCase):
         with client.session_transaction() as sess:token=sess['csrf']
         response=client.post('/login',data={'csrf':token,'password':'x'*9000},headers={'Origin':'http://localhost'})
         self.assertEqual(response.status_code,413)
+
+    def test_stale_cookie_gets_refreshed_login_form(self):
+        client=web.app.test_client();client.get('/login')
+        with client.session_transaction() as sess:old=sess['csrf']
+        client.delete_cookie(web.app.config['SESSION_COOKIE_NAME'])
+        response=client.post('/login',data={'csrf':old,'password':'fixture-password-only'},headers={'Origin':'http://localhost'})
+        self.assertEqual(response.status_code,403)
+        self.assertIn('This page has been refreshed',response.text)
+        self.assertIn('name="csrf"',response.text)
+        self.assertNotEqual(response.mimetype,'application/json')
+        with client.session_transaction() as sess:token=sess['csrf']
+        response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'},headers={'Origin':'http://localhost'})
+        self.assertEqual(response.status_code,302)
+    def test_form_post_without_origin_still_requires_valid_token(self):
+        client=web.app.test_client();client.get('/login')
+        with client.session_transaction() as sess:token=sess['csrf']
+        response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'})
+        self.assertEqual(response.status_code,302)
+    def test_proxy_external_origin_and_cross_site_rejection(self):
+        client=web.app.test_client();client.get('/login')
+        with client.session_transaction() as sess:token=sess['csrf']
+        response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'},headers={'Origin':'https://checker.example','Sec-Fetch-Site':'same-origin'})
+        self.assertEqual(response.status_code,302)
+        client=web.app.test_client();client.get('/login')
+        with client.session_transaction() as sess:token=sess['csrf']
+        response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'},headers={'Origin':'https://attacker.example','Sec-Fetch-Site':'cross-site'})
+        self.assertEqual(response.status_code,403)
+        self.assertIn('address does not match',response.text)
+    def test_explicit_public_url_for_clients_without_fetch_metadata(self):
+        client=web.app.test_client();client.get('/login')
+        with client.session_transaction() as sess:token=sess['csrf']
+        with patch.dict(web.os.environ,{'SEC_CHECKER_PUBLIC_URL':'https://checker.example/'}):
+            response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'},headers={'Origin':'https://checker.example'})
+            self.assertEqual(response.status_code,302)
+    def test_other_apps_generic_session_cookie_does_not_replace_app_cookie(self):
+        client=web.app.test_client();client.get('/login')
+        with client.session_transaction() as sess:token=sess['csrf']
+        self.assertNotEqual(web.app.config['SESSION_COOKIE_NAME'],'session')
+        client.set_cookie('session','another-apps-cookie')
+        response=client.post('/login',data={'csrf':token,'password':'fixture-password-only'},headers={'Origin':'http://localhost'})
+        self.assertEqual(response.status_code,302)

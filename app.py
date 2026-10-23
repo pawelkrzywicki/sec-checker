@@ -29,6 +29,7 @@ class UploadRequest(Request):
 app = Flask(__name__)
 app.request_class=UploadRequest
 app.config.update(SECRET_KEY=STORE.secret(), MAX_CONTENT_LENGTH=256*1024*1024,
+                  SESSION_COOKIE_NAME=os.environ.get('SEC_CHECKER_COOKIE_NAME','sec_checker_session'),
                   SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict',
                   SESSION_COOKIE_SECURE=os.environ.get('SEC_CHECKER_HTTPS','0')=='1',
                   MAX_FORM_MEMORY_SIZE=512*1024, MAX_FORM_PARTS=5)
@@ -183,8 +184,33 @@ def guard():
     if request.method=='POST':
         expected=session.get('csrf','')
         token=request.form.get('csrf','') if request.endpoint=='login' else request.headers.get('X-CSRF-Token','')
-        if not expected or not secrets.compare_digest(token,expected) or request.headers.get('Origin')!=request.host_url.rstrip('/'):
-            return jsonify(error='Session validation failed. Reload the page.'),403
+        def origin_of(value):
+            try:
+                parsed=urlsplit(value)
+                if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password:return None
+                port=parsed.port or (443 if parsed.scheme=='https' else 80)
+                return parsed.scheme.lower(),parsed.hostname.lower(),port
+            except ValueError:return None
+        origin=request.headers.get('Origin')
+        expected_origins={value for value in [origin_of(request.host_url)] if value is not None}
+        public_url=os.environ.get('SEC_CHECKER_PUBLIC_URL','').strip()
+        if public_url:
+            configured=origin_of(public_url)
+            if configured:expected_origins.add(configured)
+        # A CSRF token remains mandatory. Browsers may omit Origin on form posts.
+        # Sec-Fetch-Site is browser-controlled and reflects the external page URL,
+        # including when a reverse proxy changes the backend scheme/host.
+        origin_ok=(not origin or origin_of(origin) in expected_origins or
+            (request.headers.get('Sec-Fetch-Site')=='same-origin' and origin_of(origin) is not None))
+        valid_token=bool(expected and token and secrets.compare_digest(token.encode(),expected.encode()))
+        if not valid_token or not origin_ok:
+            if request.endpoint=='login':
+                session['csrf']=secrets.token_urlsafe(32)
+                _,_,version=auth_settings()
+                error=('The sign-in page expired or its cookie was replaced. This page has been refreshed; please enter the password again. Use the same app address and allow cookies.' if not valid_token else
+                    'The app address does not match this sign-in page. Open the app using its normal address; if a proxy changes it, configure SEC_CHECKER_PUBLIC_URL to that external address.')
+                return render_template('login.html',csrf=session['csrf'],error=error,configured=bool(version)),403
+            return jsonify(error='The page session changed. Refresh this page and try again.',reload_required=True),403
 
 @app.after_request
 def headers(response):

@@ -97,6 +97,12 @@ There is a 1,000-live-session admission ceiling, 10,000 domains per import and a
 
 Put network access behind HTTPS and set `SEC_CHECKER_HTTPS=1` for secure session cookies. The shared app password controls entry; it does not grant access to another browser’s workspace. This is one shared password, not individual user accounts. Successful login creates a new server-verified session valid for two hours. Sign-out deletes that workspace and invalidates its access even if an old cookie is replayed. Changing the configured password invalidates existing sign-ins. Ten login attempts from one source address within ten minutes trigger a temporary limit shared by web workers. Source addresses are stored only as salted hash buckets for this limiter. Keep the session cookie private. Multiple hosts, persistent accounts, account recovery, and distributed queues are outside this version.
 
+## Login session troubleshooting
+
+Sec Checker uses its own `sec_checker_session` cookie rather than Flask's generic `session` name, avoiding collisions with other apps on the same hostname (cookies are not isolated by port). Separate Sec Checker installations on the same hostname can set different `SEC_CHECKER_COOKIE_NAME` values. After an upgrade or cookie replacement, an expired sign-in form returns a refreshed sign-in page instead of a raw JSON error. Use one consistent app address and allow its cookies.
+
+Every modifying request still requires a valid CSRF token. Browser form posts without an Origin header are supported. Browser-controlled same-origin Fetch Metadata supports TLS-terminating proxies without trusting arbitrary forwarded headers. If a client omits that metadata and a proxy changes the backend host or scheme, set `SEC_CHECKER_PUBLIC_URL=https://your-external-app-address` in `.env` and recreate the container. Cross-site Origin requests are rejected. Set `SEC_CHECKER_HTTPS=1` only when using HTTPS; secure cookies will not be sent to a plain HTTP LAN IP.
+
 ## Change the password
 
 Run `python3 set_password.py` on the server, then `docker compose up --build -d --force-recreate`. The script preserves other `.env` settings, removes an old generated `.initial-password` file when setting a custom password, and never prints the password or hash. Container recreation clears current temporary workspaces, so download reports first. Keep `.env` and any initial-password file out of version control. An administrator can reset access by setting a new password with this script.
