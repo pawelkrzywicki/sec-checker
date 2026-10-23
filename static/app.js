@@ -1,6 +1,6 @@
 const $=id=>document.getElementById(id), csrf=document.querySelector('meta[name=csrf-token]').content;
 let items=[],selected=new Set(),timer;
-async function api(path,body){const options={};if(body){options.method='POST';options.headers={'X-CSRF-Token':csrf};if(body instanceof FormData)options.body=body;else{options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}}const r=await fetch(path,options);const data=await r.json();if(!r.ok)throw Error(data.error||'Request failed');return data;}
+async function api(path,body){const options={};if(body){options.method='POST';options.headers={'X-CSRF-Token':csrf};if(body instanceof FormData)options.body=body;else{options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}}const r=await fetch(path,options);const data=await r.json();if(r.status===401&&data.login_required){location.href='/login';throw Error('Please sign in again.');}if(!r.ok)throw Error(data.error||'Request failed');return data;}
 function message(text){$('message').textContent=text;}
 function filtered(){const q=$('search').value.toLowerCase();return items.filter(x=>x.host.includes(q));}
 function render(){const fragment=document.createDocumentFragment();for(const item of filtered()){const label=document.createElement('label'),box=document.createElement('input');box.type='checkbox';box.checked=selected.has(item.host);box.onchange=()=>{box.checked?selected.add(item.host):selected.delete(item.host);$('reviewed').checked=false;count();};label.append(box,document.createTextNode(item.host));if(item.saved_login||item.login_page_hint){const tag=document.createElement('span');tag.className='hint';tag.textContent=item.saved_login?'STORED PASSWORD':'LOGIN HINT';label.append(tag);}fragment.append(label);}$('domains').replaceChildren(fragment);count();}
@@ -63,3 +63,5 @@ async function poll(){try{
 
 // Restore only this browser session’s workspace after reload or worker changes.
 api('/api/inventory').then(data=>{items=data.items;if(items.length){$('review').hidden=false;render();}return api('/api/status');}).then(state=>{if(state.total){$('findings').hidden=false;poll();if(state.running){$('scan').disabled=true;$('upload').disabled=true;$('cancel').disabled=false;timer=setInterval(poll,1500);}}}).catch(e=>message(e.message));
+
+$('logout').onclick=async()=>{try{await api('/logout',{});location.href='/login';}catch(e){message(e.message);}};

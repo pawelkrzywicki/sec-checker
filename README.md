@@ -4,7 +4,13 @@ A Docker app for uploading browser history, reviewing domains, and collecting ev
 
 ## Start
 
-Requires Docker Engine/Desktop and Docker Compose.
+Requires Docker Engine/Desktop and Docker Compose. Set the app password before starting it:
+
+```sh
+python3 set_password.py
+```
+
+This prompts for a password twice and saves a password hash in the private, Git-ignored `.env` file. Use `python3 set_password.py --generate` instead to generate a strong password in `.initial-password` (also ignored, owner-readable only). The setup script needs Werkzeug, included with Flask in `requirements.txt`. The app refuses access if no password is configured. No default password is built into the image.
 
 ```sh
 docker compose up --build -d
@@ -16,7 +22,7 @@ Open **http://SERVER_IP:8787** from your browser, or **http://127.0.0.1:8787** o
 docker compose down
 ```
 
-No browser profile mounts, privileged container, Docker socket mount, account passwords or external APIs are needed. The container runs as a non-root user with a read-only filesystem and temporary upload storage in RAM. Outbound Internet access is required for selected website checks. Different browser sessions have independent workspaces and can upload and scan concurrently. For access beyond a trusted private network, use an HTTPS reverse proxy and set an application password. Set `SEC_CHECKER_PASSWORD` in a local `.env` file, then recreate the container; the browser login username is `reviewer`. The password is optional for trusted local use. Basic authentication and uploaded files need HTTPS protection on untrusted networks. To bind only one interface, set `SEC_CHECKER_BIND_IP=192.168.1.10` (or `127.0.0.1` for local-only access).
+No browser profile mounts, privileged container, Docker socket mount, account passwords or external APIs are needed. The container runs as a non-root user with a read-only filesystem and temporary upload storage in RAM. Outbound Internet access is required for selected website checks. Different browser sessions have independent workspaces and can upload and scan concurrently. Password authentication is required. Sign in with the app password; no username is needed. A password hash in `SEC_CHECKER_PASSWORD_HASH` is preferred. The older `SEC_CHECKER_PASSWORD` environment variable remains compatible, but is no longer optional protection. For network access, use an HTTPS reverse proxy and set `SEC_CHECKER_HTTPS=1` for secure cookies. Password protection does not encrypt HTTP traffic. To bind only one interface, set `SEC_CHECKER_BIND_IP=192.168.1.10` (or `127.0.0.1` for local-only access).
 
 ## Import, review, check
 
@@ -89,7 +95,11 @@ MAX_PARALLEL_IMPORTS=2
 
 There is a 1,000-live-session admission ceiling, 10,000 domains per import and a bounded temporary store; that is an admission limit, not a claim that 1,000 full-size uploads can run simultaneously. Large imports are bounded at 256 MB combined per request; JSON/CSV/text is limited to 32 MB to bound parsing memory. No load-test throughput guarantee is implied. Increase CPU/RAM/storage and benchmark before raising limits. Each web worker starts four check threads by default (`CHECK_THREADS_PER_WORKER`); the shared queue enforces the global and per-session ceilings regardless of worker count.
 
-For network access beyond a trusted group, set `SEC_CHECKER_PASSWORD`, put the service behind HTTPS and set `SEC_CHECKER_HTTPS=1` for secure session cookies. The shared access password controls entry; it does not grant access to another browser’s workspace. Keep the session cookie private. Multiple hosts, persistent accounts, account recovery, and distributed queues are outside this version.
+Put network access behind HTTPS and set `SEC_CHECKER_HTTPS=1` for secure session cookies. The shared app password controls entry; it does not grant access to another browser’s workspace. This is one shared password, not individual user accounts. Successful login creates a new server-verified session valid for two hours. Sign-out deletes that workspace and invalidates its access even if an old cookie is replayed. Changing the configured password invalidates existing sign-ins. Ten login attempts from one source address within ten minutes trigger a temporary limit shared by web workers. Source addresses are stored only as salted hash buckets for this limiter. Keep the session cookie private. Multiple hosts, persistent accounts, account recovery, and distributed queues are outside this version.
+
+## Change the password
+
+Run `python3 set_password.py` on the server, then `docker compose up --build -d --force-recreate`. The script preserves other `.env` settings, removes an old generated `.initial-password` file when setting a custom password, and never prints the password or hash. Container recreation clears current temporary workspaces, so download reports first. Keep `.env` and any initial-password file out of version control. An administrator can reset access by setting a new password with this script.
 
 ## Development and tests
 
@@ -99,8 +109,10 @@ Python 3.11+ (container uses 3.13):
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
+python set_password.py
 python -m unittest discover -s tests -v
 node tests/test_result_view.cjs  # optional UI renderer checks, requires Node.js
+# Native development: export SEC_CHECKER_PASSWORD_HASH or SEC_CHECKER_PASSWORD first.
 python app.py
 ```
 

@@ -18,17 +18,23 @@ import scanner
 
 class CheckerTests(unittest.TestCase):
     def setUp(self):
+        self.password_patch=patch.dict(web.os.environ,{'SEC_CHECKER_PASSWORD':'fixture-password-only','SEC_CHECKER_PASSWORD_HASH':''})
+        self.password_patch.start()
         web.app.config['TESTING']=True
         self.state=tempfile.TemporaryDirectory()
         web.STORE=Store(self.state.name)
         self.runner=Runner(web.STORE,lambda item:web.check_site(item),threads=2)
         self.client=web.app.test_client()
+        self.authorize(self.client)
         self.client.get('/')
         with self.client.session_transaction() as session: self.csrf=session['csrf']
         self.headers={'X-CSRF-Token':self.csrf,'Origin':'http://localhost'}
+    def authorize(self,client,base_url='http://localhost'):
+        with client.session_transaction(base_url=base_url) as sess:sess['sid']=web.STORE.sign_in(web.auth_settings()[2])
     def tearDown(self):
         self.runner.close()
         self.state.cleanup()
+        self.password_patch.stop()
     def upload(self,content,name='history.json'):
         return self.client.post('/api/upload',data={'history':(io.BytesIO(content),name)},headers=self.headers)
     def test_import_strips_secrets_and_filters(self):
@@ -45,9 +51,9 @@ class CheckerTests(unittest.TestCase):
     def test_csrf_origin_and_session_isolation(self):
         self.assertEqual(self.client.post('/api/upload').status_code,403)
         self.assertEqual(self.client.post('/api/clear',json={},headers={'X-CSRF-Token':self.csrf,'Origin':'https://evil.example'}).status_code,403)
-        self.assertEqual(self.client.get('/',headers={'Host':'192.168.1.10:8787'}).status_code,200)
+        self.assertEqual(self.client.get('/',headers={'Host':'192.168.1.10:8787'}).status_code,302)
         self.upload(b'https://example.org\n','urls.txt')
-        other=web.app.test_client();other.get('/')
+        other=web.app.test_client();self.authorize(other);other.get('/')
         self.assertEqual(other.get('/api/status').json['results'],[])
         self.assertEqual(other.get('/api/report/json').status_code,400)
     def test_private_ip_and_version_rules(self):
@@ -99,7 +105,7 @@ class CheckerTests(unittest.TestCase):
             for secret in ['ENCRYPTED_SECRET','PRIVATE_USERNAME','SECRET','blocked.example','empty.example','xvideos']:
                 self.assertNotIn(secret,response.text)
     def test_upload_and_scan_through_server_ip(self):
-        client=web.app.test_client();base='http://192.168.1.10:8787'
+        client=web.app.test_client();base='http://192.168.1.10:8787';self.authorize(client,base)
         r=client.get('/',base_url=base)
         self.assertEqual(r.status_code,200)
         with client.session_transaction(base_url=base) as sess:csrf=sess['csrf']
@@ -115,13 +121,15 @@ class CheckerTests(unittest.TestCase):
                 time.sleep(.01)
         for kind in ['html','csv','json']:
             self.assertIn('Test CA',client.get('/api/report/'+kind,base_url=base).text)
-    def test_optional_server_password(self):
-        with patch.dict(web.os.environ,{'SEC_CHECKER_PASSWORD':'test-only-secret'}):
-            self.assertEqual(self.client.get('/').status_code,401)
-            self.assertEqual(self.client.get('/health').status_code,200)
-            import base64
-            auth=base64.b64encode(b'reviewer:test-only-secret').decode()
-            self.assertEqual(self.client.get('/',headers={'Authorization':'Basic '+auth}).status_code,200)
+    def test_password_is_required(self):
+        client=web.app.test_client()
+        self.assertEqual(client.get('/').status_code,302)
+        self.assertEqual(client.get('/api/status').status_code,401)
+        self.assertEqual(client.get('/health').status_code,200)
+        with patch.dict(web.os.environ,{'SEC_CHECKER_PASSWORD':'','SEC_CHECKER_PASSWORD_HASH':''}):
+            self.assertEqual(client.get('/').status_code,503)
+            self.assertEqual(client.get('/login').status_code,503)
+            self.assertEqual(client.get('/api/status').status_code,503)
 
     def test_two_people_upload_scan_and_download_independently(self):
         import concurrent.futures
@@ -129,6 +137,7 @@ class CheckerTests(unittest.TestCase):
         clients=[web.app.test_client(),web.app.test_client()]
         headers=[]
         for client in clients:
+            self.authorize(client)
             client.get('/')
             with client.session_transaction() as sess:token=sess['csrf']
             headers.append({'X-CSRF-Token':token,'Origin':'http://localhost'})

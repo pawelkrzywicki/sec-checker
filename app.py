@@ -1,5 +1,6 @@
 """Concurrent Chrome history reviews with isolated sessions and a shared queue."""
 import csv
+import hashlib
 import io
 import json
 import os
@@ -9,10 +10,11 @@ import sqlite3
 import tempfile
 import time
 from urllib.parse import urlsplit
-from flask import Flask, Request, jsonify, render_template, request, session, Response
+from flask import Flask, Request, jsonify, render_template, request, session, Response, redirect, url_for
 from werkzeug.exceptions import HTTPException
 from scanner import host_of, EXCLUDE, check_site, NOTICE, SOURCES
 from jobs import Store, Runner, Busy
+from auth import settings as auth_settings, verify as verify_password
 from findings import select as select_findings
 
 STORE = Store(os.environ.get('SEC_CHECKER_STATE_DIR', str(Path(tempfile.gettempdir())/'sec-checker-state')),
@@ -164,17 +166,24 @@ def current():
 
 @app.before_request
 def guard():
-    # The user may access the UI by server IP or a configured domain.
-    # Keep same-origin CSRF checks; an optional password protects shared servers.
-    password = os.environ.get('SEC_CHECKER_PASSWORD', '')
-    if password and request.path != '/health':
-        auth = request.authorization
-        valid = auth and auth.type.lower() == 'basic' and auth.username == 'reviewer' and secrets.compare_digest((auth.password or '').encode(), password.encode())
-        if not valid:
-            return Response('Authentication required.', 401, {'WWW-Authenticate': 'Basic realm="Sec Checker"'})
+    if request.endpoint=='login' and request.method=='POST':
+        request.max_content_length=8192
+    public=request.endpoint in ('login','static','health')
+    if not public:
+        _,_,version=auth_settings()
+        if not version:
+            if request.path.startswith('/api/') or request.endpoint=='logout':
+                return jsonify(error='An app password must be configured before use.'),503
+            return render_template('login.html',csrf='',error=None,configured=False),503
+        if not STORE.authorized(session.get('sid'),version):
+            session.clear()
+            if request.path.startswith('/api/') or request.endpoint=='logout':
+                return jsonify(error='Sign in to access your workspace.',login_required=True),401
+            return redirect(url_for('login'))
     if request.method=='POST':
         expected=session.get('csrf','')
-        if not expected or not secrets.compare_digest(request.headers.get('X-CSRF-Token',''),expected) or request.headers.get('Origin')!=request.host_url.rstrip('/'):
+        token=request.form.get('csrf','') if request.endpoint=='login' else request.headers.get('X-CSRF-Token','')
+        if not expected or not secrets.compare_digest(token,expected) or request.headers.get('Origin')!=request.host_url.rstrip('/'):
             return jsonify(error='Session validation failed. Reload the page.'),403
 
 @app.after_request
@@ -199,6 +208,38 @@ def error(exc):
         raise exc
     # Do not log raw URLs, upload contents, or filenames in exception details.
     return jsonify(error='The operation failed. Check the file format and try again.'),500
+
+@app.route('/login',methods=['GET','POST'])
+def login():
+    _,_,version=auth_settings()
+    if not version:
+        return render_template('login.html',csrf='',error=None,configured=False),503
+    if request.method=='GET' and STORE.authorized(session.get('sid'),version):
+        return redirect(url_for('index'))
+    session.setdefault('csrf',secrets.token_urlsafe(32))
+    error=None;code=200
+    if request.method=='POST':
+        bucket=hashlib.sha256((STORE.secret()+(request.remote_addr or 'unknown')).encode()).hexdigest()
+        wait=STORE.login_attempt(bucket)
+        if wait:
+            response=Response(render_template('login.html',csrf=session['csrf'],configured=True,error='Too many attempts. Please try again later.'),429,mimetype='text/html')
+            response.headers['Retry-After']=str(wait)
+            return response
+        password=request.form.get('password','')
+        if len(password)<=1024 and verify_password(password):
+            STORE.reset_login_attempts(bucket)
+            session.clear()
+            session['sid']=STORE.sign_in(version)
+            session['csrf']=secrets.token_urlsafe(32)
+            return redirect(url_for('index'))
+        error='Incorrect password.';code=401
+    return render_template('login.html',csrf=session['csrf'],error=error,configured=True),code
+
+@app.post('/logout')
+def logout():
+    STORE.sign_out(session.get('sid'))
+    session.clear()
+    return jsonify(signed_out=True)
 
 @app.get('/')
 def index():

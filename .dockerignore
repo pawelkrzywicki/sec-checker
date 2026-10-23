@@ -4,6 +4,7 @@
 !jobs.py
 !gunicorn.conf.py
 !findings.py
+!auth.py
 !app.py
 !scanner.py
 !affected-certificates.json

@@ -13,3 +13,5 @@ Login Data*
 !affected-certificates.json
 *.csv
 private-*
+
+.initial-password
