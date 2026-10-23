@@ -20,10 +20,11 @@ No browser profile mounts, privileged container, Docker socket mount, account pa
 
 ## Import, review, check
 
-1. Upload Chrome’s `History` SQLite database or Takeout `BrowserHistory.json`. Optionally attach the same Chrome profile’s `Login Data` database to associate stored-password entries with sites (256 MB combined for databases; 32 MB maximum for JSON/CSV/text imports; unzip archives first).
+1. Upload Chrome/Edge `History`, Firefox `places.sqlite`, or Chrome Takeout `BrowserHistory.json`. Optionally attach the same profile’s Chrome/Edge `Login Data` or Firefox `logins.json` to associate stored-password entries with sites (256 MB combined for databases; 32 MB maximum for JSON/CSV/text imports; unzip archives first).
 2. Review the domain list. Nothing is selected initially. Common adult domains are filtered, but automatic filtering is incomplete. Exclude sensitive domains before starting a scan.
 3. Select the sites, confirm the review, and run the checks. Select stored-password sites or login-path hints as a selection aid. Stored entries and login paths do not prove when or whether a login occurred.
-4. Download HTML, CSV or JSON findings. Stop requests with **Stop scan**, or remove imported domains and results with **Clear imported data**.
+4. Click **Needs investigation** or the clickable investigation summary count to see only flagged sites. Each flagged row shows severity, evidence, a next step and an advisory link where available. **All results** restores the full list; **Incomplete checks** separates failed/partial checks from security evidence. Result search narrows the domains further. HTML, CSV and JSON downloads follow the active filter and search. Hidden PHP versions remain unknown and are not flagged solely for being hidden.
+5. Download HTML, CSV or JSON findings. Stop requests with **Stop scan**, or remove imported domains and results with **Clear imported data**.
 
 Accepted formats:
 
@@ -35,6 +36,16 @@ Accepted formats:
 | JSON URL list | A list of URL strings or objects with a `url` key |
 | CSV | A column named `url`; without a header, URLs in the first column |
 | Text | One full `https://...` or `http://...` URL per line |
+
+Saved-login inputs:
+
+| Browser | History file | Optional saved-login file | Find the profile |
+| --- | --- | --- | --- |
+| Chrome | `History` (SQLite) | `Login Data` (SQLite `logins` table) | `chrome://version` → Profile Path |
+| Edge | `History` (SQLite) | Compatible `Login Data` SQLite stores, including account-store filename variants | `edge://version` → Profile Path |
+| Firefox desktop | `places.sqlite` (SQLite) | `logins.json` (encrypted login records) | `about:support` → Profile Folder |
+
+Firefox bookmarks without recorded visits are excluded when the database provides visit information. The login parser uses the public `hostname`/`origin` field and checks whether an encrypted password field is present. It never decrypts the password or username, and **does not need `key4.db`**. Do not upload that encryption-key file. Desktop formats are supported; this does not claim mobile-browser or legacy pre-Chromium Edge compatibility. Import one browser profile per workspace; a new import replaces that workspace’s previous inventory.
 
 For a browser database, close the browser completely before copying the file so recent WAL entries are checkpointed. A live copy without its WAL may be incomplete. To locate the Chrome profile folder, open `chrome://version` and read **Profile Path**. Copy `History` and optionally `Login Data` from that folder. `History` does not contain stored passwords. Do not export/upload plaintext password CSV files, cookies, or the whole profile. Google Takeout can export Chrome history saved to your Google Account; it may not include all local or unsynced history. Deleted history, incognito activity and missing profiles cannot be recovered by this tool.
 
@@ -55,7 +66,7 @@ No exploits, port scans, authentication attempts, password leak lookups or crede
 
 ## Privacy and retention
 
-Raw uploads are removed after parsing, including on errors; Docker's temporary upload directory is a tmpfs. Only hostnames, login-path hints, stored-password association counts and results are retained in a shared SQLite session/queue store. In Docker, that store is on the private `/state` RAM filesystem, not a persistent volume. Raw history and raw Login Data uploads are never written to the queue store. Page titles, usernames, historical paths, query strings, fragments and passwords are not retained in the inventory. The optional Chrome Login Data parser selects only `origin_url` from `logins`, checking `length(password_value) > 0` inside SQLite to detect the presence of a stored password. It never returns/decrypts encrypted password bytes or selects usernames. Blocklisted and empty-password entries are skipped. Plaintext password exports are not accepted in the optional saved-login field. This detects account associations, not password strength or password reuse. Uploading a raw database inherently provides its contents to this local app; review or prefilter the file first if even local processing is unacceptable.
+Raw uploads are removed after parsing, including on errors; Docker's temporary upload directory is a tmpfs. Only hostnames, login-path hints, stored-password association counts and results are retained in a shared SQLite session/queue store. In Docker, that store is on the private `/state` RAM filesystem, not a persistent volume. Raw history and raw saved-login uploads are never written to the queue store. Page titles, usernames, historical paths, query strings, fragments and passwords are not retained in the inventory. The optional Chrome/Edge Login Data parser selects only `origin_url` from `logins`, checking `length(password_value) > 0` inside SQLite to detect the presence of a stored password. It never returns/decrypts encrypted password bytes or selects usernames. Blocklisted and empty-password entries are skipped. Firefox `logins.json` is parsed locally; only site association counts are retained, not encrypted fields or usernames. Plaintext password exports are not accepted in the optional saved-login field. This detects account associations, not password strength or password reuse. Uploading a raw database inherently provides its contents to this local app; review or prefilter the file first if even local processing is unacceptable.
 
 No personal history, report, analytics, API key or telemetry is included in this repository or image. The app does not send the domain list to a scanning provider. Browser sessions are isolated and expire after two hours; **Clear imported data** logically removes that session’s imported domains/results when no import or scan is active. Removing/recreating the container clears its temporary state store. Ordinary web-worker restarts keep the workspace and queue. In non-Docker development, the store lives in `/tmp/sec-checker-state` unless `SEC_CHECKER_STATE_DIR` overrides it, so it can survive a process restart. Expired records are removed by the queue workers; this is not a forensic secure-erasure guarantee. Downloaded reports remain wherever you save them. The server keeps no request access log by default.
 
@@ -89,6 +100,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 python -m unittest discover -s tests -v
+node tests/test_result_view.cjs  # optional UI renderer checks, requires Node.js
 python app.py
 ```
 
@@ -102,3 +114,7 @@ The development server listens on all interfaces at port 8787; use `BIND_HOST=12
 - [eMudhra incident tracker](https://emudhra.we-have-a-problem.com/)
 - [Bundled indicator source](https://emudhra.we-have-a-problem.com/impacted-intermediates.json)
 - [Chrome export help](https://support.google.com/chrome/answer/10248834)
+
+- [Firefox profile files](https://support.mozilla.org/en-US/kb/profiles-where-firefox-stores-user-data)
+- [Firefox password storage](https://support.mozilla.org/en-US/kb/use-primary-password-protect-stored-logins)
+- [Microsoft browser forensics guide](https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/microsoft/final/en-us/microsoft-brand/documents/IR-Guidebook-Final.pdf)

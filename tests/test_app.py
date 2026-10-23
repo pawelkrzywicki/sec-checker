@@ -176,6 +176,65 @@ class CheckerTests(unittest.TestCase):
             with path.open('wb') as stream:stream.write(b'[');stream.truncate(33*1024*1024)
             with self.assertRaisesRegex(ValueError,'32 MB'):web.extract(path)
 
+    def test_firefox_logins_and_visited_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            history=Path(temp)/'places.sqlite';db=sqlite3.connect(history)
+            db.execute('CREATE TABLE moz_places(id integer,url text,visit_count integer)')
+            db.executemany('INSERT INTO moz_places VALUES (?,?,?)',[(1,'https://visited.example/login',2),(2,'https://bookmark-only.example/',0)])
+            db.commit();db.close()
+            logins={'logins':[{'hostname':'https://visited.example/','encryptedPassword':'SECRET_ENCRYPTED','encryptedUsername':'PRIVATE_NAME'},
+                {'origin':'https://saved-only.example/','encryptedPassword':'SECRET_ENCRYPTED'},
+                {'hostname':'https://empty.example/','encryptedPassword':''},
+                {'hostname':'https://xvideos.com/','encryptedPassword':'SECRET_ENCRYPTED'}]}
+            response=self.client.post('/api/upload',headers=self.headers,data={
+                'history':(io.BytesIO(history.read_bytes()),'places.sqlite'),
+                'logins':(io.BytesIO(json.dumps(logins).encode()),'logins.json')})
+            self.assertEqual(response.status_code,200)
+            self.assertEqual({x['host'] for x in response.json['items']},{'visited.example','saved-only.example'})
+            self.assertEqual(response.json['saved_login_domains'],2)
+            for text in ['SECRET_ENCRYPTED','PRIVATE_NAME','empty.example','bookmark-only.example','xvideos']:
+                self.assertNotIn(text,response.text)
+    def test_findings_filter_and_exports_match(self):
+        self.upload(b'https://vulnerable.example/\nhttps://unknown.example/\n','History.txt')
+        with self.client.session_transaction() as sess:sid=sess['sid']
+        self.runner.close()
+        web.STORE.enqueue(sid,{'vulnerable.example','unknown.example'})
+        # Use direct claims with the test runner stopped to make fixtures deterministic.
+        self.runner.close()
+        while True:
+            task=web.STORE.claim()
+            if not task:break
+            host=task['item']['host']
+            result={'host':host,'saved_login':False,'login_page_hint':False,'tls':'TLS identity/date/trust validation passed',
+                'certificate':{},'php':{'status':'Potentially affected PHP' if host=='vulnerable.example' else 'Unknown','evidence':'PHP/8.1.1'}}
+            web.STORE.complete(task,result)
+        state=self.client.get('/api/status').json
+        flagged=[row for row in state['results'] if row['needs_investigation']]
+        self.assertEqual([row['host'] for row in flagged],['vulnerable.example'])
+        self.assertIn('Next',self.client.get('/api/report/csv?filter=investigation').text)
+        for kind in ['html','csv','json']:
+            response=self.client.get('/api/report/'+kind+'?filter=investigation')
+            self.assertEqual(response.status_code,200)
+            self.assertIn('vulnerable.example',response.text)
+            self.assertNotIn('unknown.example',response.text)
+            self.assertIn('CVE-2026-109618',response.text)
+        self.assertEqual(self.client.get('/api/report/json?filter=investigation&q=nomatch').json['results'],[])
+        self.assertEqual(self.client.get('/api/report/json?filter=bad').status_code,400)
+
+    def test_edge_history_and_account_login_database(self):
+        with tempfile.TemporaryDirectory() as temp:
+            history=Path(temp)/'History';db=sqlite3.connect(history)
+            db.execute('CREATE TABLE urls(url text)');db.execute('INSERT INTO urls VALUES (?)',('https://edge-saved.example/',));db.commit();db.close()
+            logins=Path(temp)/'Login Data For Account';db=sqlite3.connect(logins)
+            db.execute('CREATE TABLE logins(origin_url text,password_value blob)')
+            db.execute('INSERT INTO logins VALUES (?,?)',('https://edge-saved.example/',b'EDGE_ENCRYPTED_SECRET'));db.commit();db.close()
+            response=self.client.post('/api/upload',headers=self.headers,data={
+                'history':(io.BytesIO(history.read_bytes()),'History'),
+                'logins':(io.BytesIO(logins.read_bytes()),'Login Data For Account')})
+            self.assertEqual(response.status_code,200)
+            self.assertTrue(response.json['items'][0]['saved_login'])
+            self.assertNotIn('EDGE_ENCRYPTED_SECRET',response.text)
+
     def test_actual_compromised_key_detection(self):
         # Verify the scanner compares public keys, not just issuer-name strings.
         from cryptography.hazmat.primitives import serialization

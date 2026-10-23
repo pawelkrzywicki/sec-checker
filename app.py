@@ -13,6 +13,7 @@ from flask import Flask, Request, jsonify, render_template, request, session, Re
 from werkzeug.exceptions import HTTPException
 from scanner import host_of, EXCLUDE, check_site, NOTICE, SOURCES
 from jobs import Store, Runner, Busy
+from findings import select as select_findings
 
 STORE = Store(os.environ.get('SEC_CHECKER_STATE_DIR', str(Path(tempfile.gettempdir())/'sec-checker-state')),
     concurrency=int(os.environ.get('MAX_ACTIVE_CHECKS','8')),
@@ -44,12 +45,17 @@ def urls_from_file(path):
             tables = {x[0] for x in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             table = 'urls' if 'urls' in tables else 'moz_places' if 'moz_places' in tables else None
             if not table:
-                raise ValueError('Choose a Chrome History or Firefox places.sqlite database, not a password database.')
+                raise ValueError('Choose Chrome/Edge History or Firefox places.sqlite, not a password database.')
             deadline = time.monotonic()+30
             def progress(): return int(time.monotonic()>deadline)
             db.set_progress_handler(progress, 10000)
             db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2*1024*1024)
-            for row in db.execute('SELECT url FROM '+table):
+            query='SELECT url FROM '+table
+            if table=='moz_places':
+                columns={row[1] for row in db.execute('PRAGMA table_info(moz_places)')}
+                if 'visit_count' in columns:query+=' WHERE visit_count > 0'
+                elif 'moz_historyvisits' in tables:query+=' WHERE EXISTS (SELECT 1 FROM moz_historyvisits v WHERE v.place_id=moz_places.id)'
+            for row in db.execute(query):
                 yield row[0]
         finally:
             db.close()
@@ -94,20 +100,41 @@ def extract(path):
     if not hosts: raise ValueError('No supported HTTP(S) history URLs were found. Unzip Takeout first and upload BrowserHistory.json.')
     return sorted(hosts.values(),key=lambda x:(not x['login_page_hint'],x['host'])),count,excluded
 
+def extract_firefox_logins(path):
+    if Path(path).stat().st_size > 32*1024*1024:
+        raise ValueError('Firefox logins.json imports are limited to 32 MB.')
+    with open(path,encoding='utf-8-sig') as stream:
+        data=json.load(stream)
+    if not isinstance(data,dict) or not isinstance(data.get('logins'),list):
+        raise ValueError('Choose Firefox logins.json or Chrome/Edge Login Data; plaintext password exports are not accepted.')
+    hosts={}
+    for index,record in enumerate(data['logins']):
+        if index>=2_000_000:raise ValueError('Too many saved-login records.')
+        if not isinstance(record,dict):continue
+        # Only test presence of the encrypted field. Never decrypt it or retain it.
+        if not isinstance(record.get('encryptedPassword'),str) or not record['encryptedPassword']:continue
+        origin=record.get('hostname') or record.get('origin')
+        if not isinstance(origin,str):continue
+        host=host_of(origin)
+        if host and not EXCLUDE.search(host):hosts[host]=hosts.get(host,0)+1
+        if len(hosts)>10000:raise ValueError('Too many saved-login domains.')
+    return hosts
+
 def extract_saved_logins(path):
     with open(path, 'rb') as source:
-        if source.read(16) != b'SQLite format 3\x00':
-            raise ValueError('The optional saved-login file must be Chrome Login Data, not a plaintext password export.')
+        is_sqlite=source.read(16) == b'SQLite format 3\x00'
+    if not is_sqlite:
+        return extract_firefox_logins(path)
     db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
     try:
         db.execute('PRAGMA query_only=ON')
         db.execute('PRAGMA trusted_schema=OFF')
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if 'logins' not in tables:
-            raise ValueError('The optional file is not a Chrome Login Data database.')
+            raise ValueError('Choose Chrome/Edge Login Data or Firefox logins.json for the optional saved-login file.')
         columns = {row[1] for row in db.execute('PRAGMA table_info(logins)')}
         if not {'origin_url', 'password_value'} <= columns:
-            raise ValueError('Chrome saved-login database is missing required columns.')
+            raise ValueError('Chromium saved-login database is missing required columns.')
         # SQL checks presence only: encrypted password bytes and usernames are never returned.
         query = 'SELECT origin_url FROM logins WHERE length(password_value) > 0'
         if 'blacklisted_by_user' in columns:
@@ -243,23 +270,29 @@ def inventory():
 
 @app.get('/api/status')
 def status():
-    return jsonify(STORE.status(current()))
+    state=STORE.status(current())
+    state['results']=select_findings(state['results'])
+    return jsonify(state)
 
 @app.get('/api/report/<kind>')
 def report(kind):
-    results=STORE.status(current())['results']
-    if not results: raise ValueError('Run a check first.')
+    all_results=STORE.status(current())['results']
+    mode=request.args.get('filter','all')
+    results=select_findings(all_results,mode)
+    query=request.args.get('q','').strip().lower()
+    if query:results=[row for row in results if query in row['host'].lower()]
+    if not all_results: raise ValueError('Run a check first.')
     stamp=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())
     if kind=='json':
-        body=json.dumps({'generated_utc':stamp,'limitations':NOTICE,'sources':SOURCES,'results':results},indent=2);mime='application/json'
+        body=json.dumps({'generated_utc':stamp,'limitations':NOTICE,'sources':SOURCES,'filter':mode,'results':results},indent=2);mime='application/json'
     elif kind=='csv':
-        out=io.StringIO();writer=csv.writer(out);writer.writerow(['Host','Stored password entry','Login-page hint','Certificate provider','Certificate issuer','TLS','PHP','Evidence','Error'])
+        out=io.StringIO();writer=csv.writer(out);writer.writerow(['Host','Stored password entry','Login-page hint','Certificate provider','Certificate issuer','TLS','PHP','Evidence','Error','Review status','Severity','Why investigate','Next steps'])
         for r in results:
-            row=[r['host'],r.get('saved_login',False),r['login_page_hint'],r.get('certificate',{}).get('provider','Unknown'),r.get('certificate',{}).get('issuer','Unknown'),r['tls'],r['php']['status'],r['php']['evidence'],r.get('error','')]
+            row=[r['host'],r.get('saved_login',False),r['login_page_hint'],r.get('certificate',{}).get('provider','Unknown'),r.get('certificate',{}).get('issuer','Unknown'),r['tls'],r['php']['status'],r['php']['evidence'],r.get('error',''),r['review_status'],'; '.join(dict.fromkeys(x['severity'] for x in r['findings'])),'; '.join(x['title']+': '+x['reason'] for x in r['findings']),'; '.join(x['action'] for x in r['findings'])]
             writer.writerow(["'"+v if isinstance(v,str) and v.startswith(('=','+','-','@','\t','\r')) else v for v in row])
         body=out.getvalue();mime='text/csv'
     elif kind=='html':
-        body=render_template('report.html',results=results,notice=NOTICE,sources=SOURCES,stamp=stamp);mime='text/html'
+        body=render_template('report.html',results=results,notice=NOTICE,sources=SOURCES,stamp=stamp,mode=mode);mime='text/html'
     else: return jsonify(error='Unknown report format.'),404
     return Response(body,mimetype=mime,headers={'Content-Disposition':f'attachment; filename="site-exposure-report.{kind}"'})
 
