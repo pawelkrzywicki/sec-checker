@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 

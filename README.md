@@ -1,93 +1,84 @@
-# sec checker 
+# Sec Checker
 
+A local Docker app for uploading browser history, reviewing domains, and collecting evidence of exposure to the October 2026 PHP and eMudhra certificate incidents. It flags potential problems and unknowns; it does not prove website safety or account compromise.
 
+## Start
 
-## Getting started
+Requires Docker Engine/Desktop and Docker Compose.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin http://glab.pawelkrzywicki.com/myprojects/sec-checker.git
-git branch -M main
-git push -uf origin main
+```sh
+docker compose up --build -d
 ```
 
-## Integrate with your tools
+Open **http://127.0.0.1:8787**. The service is published on loopback only. To stop and clear container memory:
 
-- [ ] [Set up project integrations](http://glab.pawelkrzywicki.com/myprojects/sec-checker/-/settings/integrations)
+```sh
+docker compose down
+```
 
-## Collaborate with your team
+No browser profile mounts, privileged container, Docker socket mount, account passwords or external APIs are needed. The container runs as a non-root user with a read-only filesystem and temporary upload storage in RAM. Outbound Internet access is required for selected website checks. This is a single-user local application, not a hosted multi-user service; do not expose its port publicly.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Import, review, check
 
-## Test and Deploy
+1. Upload one history file (up to 256 MB; unzip archives first).
+2. Review the domain list. Nothing is selected initially. Common adult domains are filtered, but automatic filtering is incomplete. Exclude sensitive domains before starting a scan.
+3. Select the sites, confirm the review, and run the checks. Login-path hints are available as a selection aid; they do not prove a login occurred.
+4. Download HTML, CSV or JSON findings. Stop requests with **Stop scan**, or remove imported domains and results with **Clear imported data**.
 
-Use the built-in continuous integration in GitLab.
+Accepted formats:
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+| Input | File |
+| --- | --- |
+| Chrome / Chromium / Edge | A copy of the `History` SQLite database |
+| Firefox | A copy of `places.sqlite` |
+| Chrome Google Takeout | `BrowserHistory.json`, usually with a `Browser History` array |
+| JSON URL list | A list of URL strings or objects with a `url` key |
+| CSV | A column named `url`; without a header, URLs in the first column |
+| Text | One full `https://...` or `http://...` URL per line |
 
-***
+For a browser database, close the browser completely before copying the file so recent WAL entries are checkpointed. A live copy without its WAL may be incomplete. To locate the Chrome profile folder, open `chrome://version` and read **Profile Path**. Copy only the `History` file from that folder. Do not export/upload passwords or cookies. Google Takeout can export Chrome history saved to your Google Account; it may not include all local or unsynced history. Deleted history, incognito activity and missing profiles cannot be recovered by this tool.
 
-# Editing this README
+## What it checks
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+- Anonymous `HEAD /` over HTTPS to each selected hostname on port 443. No redirects or historical URL paths are followed.
+- Standard TLS hostname, validity and trust verification.
+- Presented certificate/public-key fingerprints against the bundled affected eMudhra TLS intermediates, including cross-signs. It does not flag the whole company by name.
+- Exposed PHP version strings against upstream fixes **8.2.35 / 8.3.36 / 8.4.27 / 8.5.12**, for **CVE-2026-109618** and **CVE-2026-109619**.
+- Public DNS addresses only. Private, loopback, reserved and mixed public/private resolutions are blocked; the public address is pinned for the request.
 
-## Suggestions for a good README
+A hidden version stays **Unknown**. Headers can be wrong, vendor backports may retain older version labels, and a CDN can hide its origin server. The further **23 October 2026 session-upload-progress configuration issue (CVE-2026-115560)** cannot be assessed from a public header. Even an advertised version containing the October 21 fixes is not an all-clear.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+The certificate check describes the current connection, not certificates your browser saw previously. It does not implement comprehensive revocation checking, inspect Chrome CRLSet, scan other apps' trust stores, or prove the absence of past interception. If TLS validation fails, no HTTP request is sent. If the full presented chain is unavailable, the report says so.
 
-## Name
-Choose a self-explaining name for your project.
+No exploits, port scans, authentication attempts, password leak lookups or credential submissions are performed. Each selected site sees your source IP and an anonymous request. A site can still be vulnerable when these limited checks find no exposed evidence.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Privacy and retention
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Raw uploads are removed after parsing, including on errors; Docker's temporary upload directory is a tmpfs. Only hostnames and login-path hints are retained in app memory. Page titles, usernames, historical paths, query strings, fragments and passwords are not retained in the inventory. The parser never queries credential tables and rejects password-only databases. Uploading a raw database inherently provides its contents to this local app; review or prefilter the file first if even local processing is unacceptable.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+No personal history, report, analytics, API key or telemetry is included in this repository or image. The app does not send the domain list to a scanning provider. Browser sessions are isolated and expire after two hours; **Clear imported data** removes the session's imported domains/results immediately when no scan is active. Stopping/restarting the container clears all memory. Downloaded reports remain wherever you save them. The server keeps no request access log by default.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+The incident indicator file is a **23 October 2026 snapshot**, not a live general vulnerability feed. Refresh it and review version rules as advisories change. Review upstream changes before installing dependencies or rebuilding later.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+## Development and tests
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Python 3.11+ (container uses 3.13):
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python app.py
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+The development server also listens only at http://127.0.0.1:8787. Production uses one Gunicorn worker with threads because session state is held in memory. Do not increase worker count without moving session/job state to a shared store.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+## Sources
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- [PHP official advisories](https://www.php.net/archive/2026.php)
+- [PHP OOM advisory](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+- [PHP stale-state advisory](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
+- [eMudhra incident tracker](https://emudhra.we-have-a-problem.com/)
+- [Bundled indicator source](https://emudhra.we-have-a-problem.com/impacted-intermediates.json)
+- [Chrome export help](https://support.google.com/chrome/answer/10248834)

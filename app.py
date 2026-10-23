@@ -97,6 +97,18 @@ def current():
             sid=secrets.token_urlsafe(24);session['sid']=sid;JOBS[sid]=new_job()
         return JOBS[sid]
 
+def expire_sessions():
+    while True:
+        time.sleep(30)
+        with LOCK:
+            for key in list(JOBS):
+                if time.monotonic()-JOBS[key]['created']>TTL:
+                    JOBS[key]['cancel'].set()
+                    del JOBS[key]
+
+threading.Thread(target=expire_sessions,daemon=True).start()
+
+
 @app.before_request
 def guard():
     if request.host.split(':')[0] not in ('127.0.0.1','localhost'):
@@ -120,6 +132,8 @@ def error(exc):
         return jsonify(error=str(exc)[:250]),400
     if isinstance(exc,sqlite3.Error):
         return jsonify(error='Could not read this history database. Close the browser and make a fresh copy, including its WAL if needed, or use a JSON export.'),400
+    if app.testing:
+        raise exc
     # Do not log raw URLs, upload contents, or filenames in exception details.
     return jsonify(error='The operation failed. Check the file format and try again.'),500
 
@@ -198,7 +212,7 @@ def clear():
 def status():
     job=current()
     with LOCK:
-        return jsonify({k:job[k] for k in ('results','running','done','total','error')},cancelled=job['cancel'].is_set())
+        return jsonify({**{k:job[k] for k in ('results','running','done','total','error')}, 'cancelled':job['cancel'].is_set()})
 
 @app.get('/api/report/<kind>')
 def report(kind):
