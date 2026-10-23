@@ -1,0 +1,16 @@
+services:
+  history-checker:
+    build: .
+    ports:
+      - "127.0.0.1:8787:8787"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=384m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 128
+    restart: "no"

@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!requirements.txt
+!app.py
+!scanner.py
+!affected-certificates.json
+!templates/
+!templates/**
+!static/
+!static/**

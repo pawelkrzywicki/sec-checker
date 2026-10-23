@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+*.sqlite
+History
+*report*.json
+*report*.csv
