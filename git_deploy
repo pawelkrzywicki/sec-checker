@@ -1,5 +1,4 @@
-git add .; 
+ git add .; 
 git commit -m "`date` - new fix/feaute";
 git push;
-scp -r * root@192.168.0.101:/root/docker/sec-checker/
 
